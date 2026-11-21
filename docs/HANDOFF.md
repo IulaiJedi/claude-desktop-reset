@@ -1,6 +1,21 @@
 # Передача — claude-desktop-reset
 
-## 21.11.2026 — сейчас
+## 21.11.2026, вечер — сейчас
+
+**Готово:** ClaudeReset и модуль Claude Traffic Control на `main` (`91d6a51`), приватный
+GitHub `IulaiJedi/claude-desktop-reset`. 90 тестов: 56 ClaudeReset, 34 Traffic Control
+(из них 1 — на настоящем адаптере через `cmd.exe`). Три PDF-инструкции: `docs/instrukcii/`.
+
+**Ревью Traffic Control (Fable):** первый проход — 14 находок, 14 подтверждены и исправлены;
+второй — 7 новых, все исправлены (критическая: `Start-Process` в PS 5.1 терял код выхода,
+проверка давала бы ERROR всегда). После второго прохода код третьим ревью не читался —
+последние правки закрыты тестами и живым безопасным прогоном пути WSL (`/bin/echo`).
+
+**Не проверено здесь (запрещено оператором):** создание и удаление правил брандмауэра и
+Hyper-V, смена типа службы, запись настроек, `claude -p`. Первый живой прогон — у оператора:
+`TrafficControl.cmd` от администратора → SAFE → проверка с тестовым запросом.
+
+## 21.11.2026 — Windows-версия ClaudeReset
 
 **Готово:** Windows-версия, `main` на `5d94b19`. `windows/ClaudeReset.ps1` + `run.cmd`,
 `audit.cmd`, `README.md`. Архив для оператора: `C:\Users\iulaijedi\Downloads\ClaudeReset-windows.zip`.
