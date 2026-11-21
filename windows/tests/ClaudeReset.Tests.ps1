@@ -42,6 +42,7 @@ function New-FakeSys([switch]$NoPackage) {
         }
     }
     $sys = @{
+        IsFake            = $true
         State             = $state
         GetDesktopPackage = { $state.Package }.GetNewClosure()
         RemovePackage     = { param($full) [void]$state.Log.Add("RemovePackage $full"); $state.Package = $null }.GetNewClosure()
@@ -51,6 +52,7 @@ function New-FakeSys([switch]$NoPackage) {
         StopService       = { param($n) [void]$state.Log.Add("StopService $n") }.GetNewClosure()
         RegKeyExists      = { param($k) $state.Registry.ContainsKey($k) }.GetNewClosure()
         RegGetValues      = { param($k) if ($state.Registry.ContainsKey($k)) { $state.Registry[$k] } else { $null } }.GetNewClosure()
+        RegRemoveValue    = { param($k, $n) [void]$state.Log.Add("RegRemoveValue $k $n"); if ($state.Registry.ContainsKey($k)) { $state.Registry[$k].Remove($n) } }.GetNewClosure()
         RegRemoveKey      = { param($k) [void]$state.Log.Add("RegRemoveKey $k"); foreach ($x in @($state.Registry.Keys)) { if ($x -eq $k -or $x.StartsWith($k + '\')) { $state.Registry.Remove($x) } } }.GetNewClosure()
         GetUserEnv        = { param($n) $state.UserEnv[$n] }.GetNewClosure()
         RemoveUserEnv     = { param($n) [void]$state.Log.Add("RemoveUserEnv $n"); $state.UserEnv.Remove($n) }.GetNewClosure()
@@ -252,5 +254,83 @@ Describe 'Reset levels on Desktop data' {
         Test-Path -LiteralPath $t.Root | Should Be $false
         $t.Problems.Count | Should Be 0
         Test-Path -LiteralPath "$($t.Ctx.Paths.UserProfile)\.claude\.credentials.json" | Should Be $true
+    }
+}
+
+# ---------- 4. Level 3: outside the package and the registry ----------
+
+Describe 'Level 3 outside the data folder' {
+    It 'removes outside logs, installer leftovers and Desktop registry keys, keeps CLI keys' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        New-FakeClaudeCode $m
+        $l = $m.Paths.LocalAppData; $t = $m.Paths.Temp; $pd = $m.Paths.ProgramData
+        New-FakeFile "$l\Claude\logs\main.log" 'log'
+        New-FakeFile "$l\Claude\app-1.0\Claude.exe" 'squirrel app'     # not ours to delete here
+        New-Item -ItemType Directory -Force -Path "$l\Claude-Data" | Out-Null
+        New-FakeFile "$pd\Claude\Logs\cowork-service.log" 'svc'
+        (Get-Item "$pd\Claude\Logs\cowork-service.log").IsReadOnly = $true
+        New-FakeFile "$t\ClaudeSetup.log" 'setup'
+        New-FakeFile "$t\Claude-4219000797.msix" 'msix'
+        New-FakeFile "$t\Other-1.msix" 'not claude'
+        $reg = $sys.State.Registry
+        $reg['HKCU:\Software\Classes\claude'] = @{ '(default)' = 'URL:claude'; 'URL Protocol' = '' }
+        $reg['HKCU:\Software\Classes\claude-cli'] = @{ '(default)' = 'URL:claude-cli' }
+        $reg['HKCU:\Software\Classes\claude-cli\shell\open\command'] = @{ '(default)' = '"C:\Users\u\.local\bin\claude.exe" --handle-uri "%1"' }
+        $reg['HKCU:\Software\Classes\Applications\claude-desktop.exe'] = @{}
+        $reg['HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\claude'] = @{}
+        $reg['HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\claude-ssh-proxy.exe'] = @{}
+        $reg['HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.anthropic.claude_browser_extension'] = @{ '(default)' = 'x.json' }
+        $reg['HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.anthropic.claude_code_browser_extension'] = @{ '(default)' = 'y.json' }
+        $reg['HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'] = @{ 'Claude' = 'C:\Users\u\AppData\Local\AnthropicClaude\Update.exe --processStart Claude.exe'; 'Other' = 'C:\other.exe' }
+        $ctx = New-TestContext $m $sys
+
+        $plan = Get-CrDesktopPlan $ctx -Level 3
+        $null = Invoke-CrPlan $ctx $plan
+
+        Test-Path -LiteralPath "$l\Claude\logs" | Should Be $false
+        Test-Path -LiteralPath "$l\Claude\app-1.0\Claude.exe" | Should Be $true
+        Test-Path -LiteralPath "$l\Claude-Data" | Should Be $false
+        Test-Path -LiteralPath "$pd\Claude" | Should Be $false
+        Test-Path -LiteralPath "$t\ClaudeSetup.log" | Should Be $false
+        Test-Path -LiteralPath "$t\Claude-4219000797.msix" | Should Be $false
+        Test-Path -LiteralPath "$t\Other-1.msix" | Should Be $true
+
+        $reg.ContainsKey('HKCU:\Software\Classes\claude') | Should Be $false
+        $reg.ContainsKey('HKCU:\Software\Classes\Applications\claude-desktop.exe') | Should Be $false
+        $reg.ContainsKey('HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\claude') | Should Be $false
+        $reg.ContainsKey('HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\claude-ssh-proxy.exe') | Should Be $false
+        $reg.ContainsKey('HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.anthropic.claude_browser_extension') | Should Be $false
+        $reg['HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'].ContainsKey('Claude') | Should Be $false
+        $reg['HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'].ContainsKey('Other') | Should Be $true
+        # Claude Code keys stay
+        $reg.ContainsKey('HKCU:\Software\Classes\claude-cli') | Should Be $true
+        $reg.ContainsKey('HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.anthropic.claude_code_browser_extension') | Should Be $true
+    }
+
+    It 'removes the Desktop log folder parent once it is empty, but never a non-empty one' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $l = $m.Paths.LocalAppData
+        New-FakeFile "$l\Claude\logs\main.log" 'log'
+        New-FakeFile "$l\Claude-Data\claude_pzs8sxrjxfjjc\Local State" '{}'
+        $ctx = New-TestContext $m $sys
+        $null = Invoke-CrPlan $ctx (Get-CrDesktopPlan $ctx -Level 3)
+        Test-Path -LiteralPath "$l\Claude" | Should Be $false
+        Test-Path -LiteralPath "$l\Claude-Data" | Should Be $false
+        (Test-CrDeletable $ctx "$l\Claude").Allowed | Should Be $false
+    }
+
+    It 'keeps the claude:// key when it opens the Claude Code CLI' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $sys.State.Registry['HKCU:\Software\Classes\claude'] = @{ '(default)' = 'URL:claude' }
+        $sys.State.Registry['HKCU:\Software\Classes\claude\shell\open\command'] = @{ '(default)' = '"C:\Users\u\.local\bin\claude.exe" --handle-uri "%1"' }
+        $ctx = New-TestContext $m $sys
+        $null = Invoke-CrPlan $ctx (Get-CrDesktopPlan $ctx -Level 3)
+        $sys.State.Registry.ContainsKey('HKCU:\Software\Classes\claude') | Should Be $true
+    }
+
+    It 'refuses to run sandboxed with the real system adapter' {
+        $m = New-FakeMachine
+        { New-CrContext -Paths $m.Paths -SandboxRoot $m.Root -DataDir (Join-Path $m.Root 'out') } | Should Throw
     }
 }

@@ -84,6 +84,7 @@ function New-CrRealSys {
             return $h
         }
         RegRemoveKey      = { param($k) Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction Stop }
+        RegRemoveValue    = { param($k, $n) Remove-ItemProperty -LiteralPath $k -Name $n -Force -ErrorAction Stop }
         GetUserEnv        = { param($n) [Environment]::GetEnvironmentVariable($n, 'User') }
         RemoveUserEnv     = { param($n) [Environment]::SetEnvironmentVariable($n, $null, 'User') }
         FindClaudeCli     = {
@@ -117,6 +118,9 @@ function New-CrContext {
             ProgramData  = [Environment]::GetFolderPath('CommonApplicationData')
             Temp         = [IO.Path]::GetTempPath().TrimEnd('\')
         }
+    }
+    if ($SandboxRoot -and -not ($Sys -and $Sys.ContainsKey('IsFake') -and $Sys.IsFake)) {
+        throw 'Песочница работает только с подставным системным адаптером.'
     }
     if (-not $Sys) { $Sys = New-CrRealSys }
     if (-not $DataDir) {
@@ -305,15 +309,22 @@ function Get-CrAllowedRoots($ctx) {
         }
         else { [void]$roots.Add($pkg) }   # пакет снят, осталась папка
     }
-    foreach ($r in @((Join-Path $p.AppData 'Claude'), (Join-Path $p.LocalAppData 'Claude-Data'), (Join-Path $p.LocalAppData 'Claude-3p'),
-            (Join-Path $p.LocalAppData 'Claude\logs'), (Join-Path $p.ProgramData 'Claude'), (Join-Path $p.LocalAppData 'AnthropicClaude'),
+    foreach ($r in @((Join-Path $p.AppData 'Claude'), (Join-Path $p.LocalAppData ('Claude-Data\' + $script:CrKnownPfn.ToLowerInvariant())),
+            (Join-Path $p.LocalAppData 'Claude-3p'), (Join-Path $p.LocalAppData 'Claude\logs'), (Join-Path $p.ProgramData 'Claude\Logs'),
+            (Join-Path $p.LocalAppData 'AnthropicClaude'),
             (Join-Path $p.AppData 'Microsoft\Windows\Start Menu\Programs\Claude.lnk'), (Join-Path $p.Temp 'ClaudeSetup.log'))) {
         [void]$roots.Add($r)
     }
     return @($roots)
 }
 
-function Test-CrDeletable($ctx, [string]$Path, [switch]$AllowCodeAuth) {
+function Get-CrEmptyOnlyDirs($ctx) {
+    # Эти папки удаляются только пустыми: в %LOCALAPPDATA%\Claude на «гибридных» машинах живёт старый установщик.
+    $p = $ctx.Paths
+    return @((Join-Path $p.LocalAppData 'Claude'), (Join-Path $p.LocalAppData 'Claude-Data'), (Join-Path $p.ProgramData 'Claude'))
+}
+
+function Test-CrDeletable($ctx, [string]$Path, [switch]$AllowCodeAuth, [switch]$OnlyIfEmpty) {
     $full = Get-CrFullPath $Path
     $p = $ctx.Paths
     $codeAuth = @()
@@ -326,7 +337,8 @@ function Test-CrDeletable($ctx, [string]$Path, [switch]$AllowCodeAuth) {
     $leaf = Split-Path -Leaf $full
     $underRoot = [bool](Get-CrAllowedRoots $ctx | Where-Object { Test-CrUnder $full (Get-CrFullPath $_) })
     $isMsixDownload = ((Split-Path -Parent $full) -ieq (Get-CrFullPath $p.Temp)) -and ($leaf -like 'Claude-*.msix')
-    if (-not ($underRoot -or $isCodeAuth -or $isMsixDownload -or ($extra -icontains $full))) {
+    $isEmptyOnly = $OnlyIfEmpty -and [bool](Get-CrEmptyOnlyDirs $ctx | Where-Object { (Get-CrFullPath $_) -ieq $full })
+    if (-not ($underRoot -or $isCodeAuth -or $isMsixDownload -or $isEmptyOnly -or ($extra -icontains $full))) {
         return @{ Allowed = $false; Reason = 'вне разрешённых путей' }
     }
 
@@ -375,7 +387,7 @@ function Remove-CrTree([string]$Path, [System.Collections.ArrayList]$Errors) {
 function Invoke-CrDelete($ctx, [string]$Path, [switch]$OnlyIfEmpty, [switch]$AllowCodeAuth) {
     Assert-CrInSandbox $ctx $Path
     $full = Get-CrFullPath $Path
-    $check = Test-CrDeletable $ctx $full -AllowCodeAuth:$AllowCodeAuth
+    $check = Test-CrDeletable $ctx $full -AllowCodeAuth:$AllowCodeAuth -OnlyIfEmpty:$OnlyIfEmpty
     if (-not $check.Allowed) {
         Write-CrLog $ctx 'REFUSED' $full $check.Reason
         return [pscustomobject]@{ Path = $full; Status = 'refused'; Bytes = 0; Error = $check.Reason }
@@ -451,6 +463,7 @@ function Get-CrDesktopPlan($ctx, [int]$Level, [switch]$IncludeLogs) {
                 }
             }
             foreach ($o in (Get-CrDesktopOutsideItems $ctx)) { [void]$plan.Add($o) }
+            foreach ($r in (Get-CrDesktopRegistryItems $ctx)) { [void]$plan.Add($r) }
         }
         default { throw "Нет такого уровня: $Level" }
     }
@@ -459,6 +472,7 @@ function Get-CrDesktopPlan($ctx, [int]$Level, [switch]$IncludeLogs) {
 
 function Optimize-CrPlan($plan) {
     # Убирает пункты, лежащие внутри других пунктов плана.
+    $plan = @($plan | Where-Object { $_ })
     $files = @($plan | Where-Object { @('dir', 'file', 'emptydir') -contains $_.Kind })
     $rest = @($plan | Where-Object { -not (@('dir', 'file', 'emptydir') -contains $_.Kind) })
     $keep = New-Object System.Collections.ArrayList
@@ -471,6 +485,7 @@ function Optimize-CrPlan($plan) {
 
 function Invoke-CrPlan($ctx, $plan, [switch]$AllowCodeAuth) {
     $results = New-Object System.Collections.ArrayList
+    $plan = @($plan | Where-Object { $_ })
     # Сначала обычные пункты, потом «удалить, если опустела».
     $ordered = @($plan | Where-Object { $_.Kind -ne 'emptydir' }) + @($plan | Where-Object { $_.Kind -eq 'emptydir' })
     foreach ($i in $ordered) {
@@ -485,6 +500,82 @@ function Invoke-CrPlan($ctx, $plan, [switch]$AllowCodeAuth) {
         }
     }
     return @($results)
+}
+
+# ============================================================================
+#  Реестр Desktop — переживает удаление пакета (виртуализация реестра выключена)
+# ============================================================================
+
+$script:CrBrowserRegVendors = @('Google\Chrome', 'BraveSoftware\Brave-Browser', 'Microsoft\Edge', 'Palo Alto Networks\PrismaAccessBrowser',
+    'Island\Island', 'Chromium', 'ArcBrowser\Arc', 'Vivaldi', 'Opera Software\Opera Stable')
+
+function Test-CrPointsToDesktop([string]$Value) {
+    return $Value -match '(?i)AnthropicClaude|\\WindowsApps\\Claude_|claude-desktop\.exe'
+}
+
+function Get-CrDesktopRegistryItems($ctx) {
+    $sys = $ctx.Sys
+    $items = New-Object System.Collections.ArrayList
+    $addKey = {
+        param($key, $purpose)
+        if (& $sys.RegKeyExists $key) {
+            [void]$items.Add((New-CrItem -Area 'registry' -RootKind 'registry' -Root $key -Path $key -Kind 'regkey' -Group 'registry' -Purpose $purpose -Risk 'низкий' -Consequence 'Ключ Desktop в реестре; после удаления приложения не нужен.' -Bytes 0))
+        }
+    }
+    # claude:// — только если не ведёт в Claude Code CLI.
+    $proto = 'HKCU:\Software\Classes\claude'
+    if (& $sys.RegKeyExists $proto) {
+        $cmd = & $sys.RegGetValues "$proto\shell\open\command"
+        $target = if ($cmd -and $cmd.ContainsKey('(default)')) { [string]$cmd['(default)'] } else { '' }
+        if ($target -notmatch '(?i)\.local\\bin\\claude\.exe|claude-cli|--handle-uri') { & $addKey $proto 'Протокол claude:// (Desktop)' }
+    }
+    & $addKey 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\claude' 'Привязка claude://'
+    & $addKey 'HKCU:\Software\Classes\Applications\claude-desktop.exe' 'Регистрация claude-desktop.exe'
+    & $addKey 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\claude-ssh-askpass.exe' 'Помощник SSH Desktop'
+    & $addKey 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\claude-ssh-proxy.exe' 'Помощник SSH Desktop'
+    foreach ($v in $script:CrBrowserRegVendors) {
+        & $addKey "HKCU:\Software\$v\NativeMessagingHosts\$($script:CrDesktopNativeHost)" 'Мост Desktop к расширению Claude in Chrome'
+    }
+    $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $vals = & $sys.RegGetValues $run
+    if ($vals) {
+        foreach ($n in @($vals.Keys)) {
+            if (Test-CrPointsToDesktop ([string]$vals[$n])) {
+                [void]$items.Add((New-CrItem -Area 'registry' -RootKind 'registry' -Root $run -Path "$run|$n" -Kind 'regvalue' -Group 'registry' -Purpose 'Автозапуск Desktop' -Risk 'низкий' -Consequence 'Desktop перестанет запускаться при входе в Windows.' -Bytes 0))
+            }
+        }
+    }
+    $uninst = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AnthropicClaude'
+    if (-not [System.IO.Directory]::Exists((Join-Path $ctx.Paths.LocalAppData 'AnthropicClaude'))) { & $addKey $uninst 'Запись старого установщика без самой программы' }
+    return @($items)
+}
+
+function Test-CrRegistryDeletable($ctx, [string]$Key) {
+    $allowed = @('HKCU:\Software\Classes\claude', 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\claude',
+        'HKCU:\Software\Classes\Applications\claude-desktop.exe', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\claude-ssh-askpass.exe',
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\claude-ssh-proxy.exe', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AnthropicClaude')
+    $allowed += @($script:CrBrowserRegVendors | ForEach-Object { "HKCU:\Software\$_\NativeMessagingHosts\$($script:CrDesktopNativeHost)" })
+    return [bool]($allowed | Where-Object { $_ -ieq $Key })
+}
+
+function Invoke-CrAction_regkey($ctx, $item) {
+    if (-not (Test-CrRegistryDeletable $ctx $item.Path)) {
+        Write-CrLog $ctx 'REFUSED' $item.Path 'ключ не из списка Desktop'
+        return [pscustomobject]@{ Path = $item.Path; Status = 'refused'; Bytes = 0; Error = 'ключ не из списка Desktop' }
+    }
+    try { & $ctx.Sys.RegRemoveKey $item.Path; Write-CrLog $ctx 'REG-DELETED' $item.Path ''; return [pscustomobject]@{ Path = $item.Path; Status = 'deleted'; Bytes = 0; Error = '' } }
+    catch { Write-CrLog $ctx 'FAILED' $item.Path $_.Exception.Message; return [pscustomobject]@{ Path = $item.Path; Status = 'failed'; Bytes = 0; Error = $_.Exception.Message } }
+}
+
+function Invoke-CrAction_regvalue($ctx, $item) {
+    $key, $name = $item.Path -split '\|', 2
+    $vals = & $ctx.Sys.RegGetValues $key
+    if (-not ($vals -and $vals.ContainsKey($name) -and (Test-CrPointsToDesktop ([string]$vals[$name])))) {
+        Write-CrLog $ctx 'REFUSED' $item.Path 'значение не ведёт в Desktop'
+        return [pscustomobject]@{ Path = $item.Path; Status = 'refused'; Bytes = 0; Error = 'значение не ведёт в Desktop' }
+    }
+    try { & $ctx.Sys.RegRemoveValue $key $name; Write-CrLog $ctx 'REG-DELETED' $item.Path ''; return [pscustomobject]@{ Path = $item.Path; Status = 'deleted'; Bytes = 0; Error = '' } }
+    catch { Write-CrLog $ctx 'FAILED' $item.Path $_.Exception.Message; return [pscustomobject]@{ Path = $item.Path; Status = 'failed'; Bytes = 0; Error = $_.Exception.Message } }
 }
 
 # ============================================================================
