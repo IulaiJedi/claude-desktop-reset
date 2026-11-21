@@ -2,7 +2,7 @@
 
 Инструмент аудита, бэкапа и сброса локальных данных Claude Desktop без вреда
 для Claude Code; плюс чистка «без следов входа» (Desktop, вход CLI, браузеры).
-Платформы: Windows (готово), Ubuntu/WSL и macOS (впереди).
+Платформы: Windows (готово), Ubuntu/WSL (готово, `linux/`), macOS (впереди — нужен живой Mac для аудита).
 
 ## Где что
 
@@ -13,12 +13,15 @@
 - `windows/TrafficControl/` — модуль Claude Traffic Control (спека `docs/spec-traffic-control.md`),
   подключает ядро `ClaudeReset.ps1`; запуск — `windows/TrafficControl.cmd` или пункт 10 меню.
 - `windows/tests/` — Pester 3.4: `ClaudeReset.Tests.ps1`, `TrafficControl.Tests.ps1`.
+- `linux/claude_reset.py` + `linux/claude-reset` — версия для Ubuntu/WSL (Python 3, только stdlib),
+  спека `docs/spec-linux.md`; тесты `linux/tests/run.sh` (`unittest`, `HOME` подменён на временную папку).
 - `docs/instrukcii/*.md` — исходники PDF-инструкций; сборка:
   `cd ~/projects/consultations && uv run --with markdown python build.py <md>` (визитка — `BRAND` там).
 
 ## Команды
 
-- Тесты из WSL: `windows/tests/run.sh` (код выхода = число упавших).
+- Тесты из WSL: `windows/tests/run.sh` (код выхода = число упавших), `linux/tests/run.sh`.
+- Мутационная проверка защит — только от закоммиченного состояния (`git checkout` откатывает к коммиту).
 - После любой правки `.ps1` через инструменты Linux: `./tools-bom.sh windows/*.ps1 windows/tests/*.ps1` —
   Windows PowerShell 5.1 читает файл без BOM как ANSI и ломает кириллицу.
 
