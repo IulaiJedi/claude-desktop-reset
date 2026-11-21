@@ -149,3 +149,108 @@ Describe 'Inventory of Claude Desktop data' {
         @(Get-CrDesktopInventory $ctx).Count | Should Be 0
     }
 }
+
+# ---------- 2. Delete guard ----------
+
+Describe 'Delete guard' {
+    It 'refuses Claude Code, WSL disks, foreign packages, repos and anything outside allowed roots' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        New-FakeClaudeCode $m
+        $u = $m.Paths.UserProfile; $l = $m.Paths.LocalAppData
+        New-FakeFile "$l\wsl\{guid}\ext4.vhdx" 'disk'
+        New-FakeFile "$l\Packages\Other.App_123\LocalCache\x" 'x'
+        New-FakeFile "$r\repo-inside\.git\HEAD" 'ref'
+        New-FakeFile "$r\memory-inside\CLAUDE.md" 'rules'
+        $ctx = New-TestContext $m $sys
+
+        foreach ($p in @("$u\.claude", "$u\.claude\projects", "$u\.claude.json", "$u\.local", "$u\.local\bin\claude.exe",
+                "$l\wsl", "$l\wsl\{guid}\ext4.vhdx", "$l\Packages\Other.App_123", "$l\Packages", $l, $u,
+                "$r\repo-inside", "$r\memory-inside", "$($m.Paths.AppData)\SomethingElse")) {
+            (Test-CrDeletable $ctx $p).Allowed | Should Be $false
+        }
+        (Test-CrDeletable $ctx "$r\Cache").Allowed | Should Be $true
+        (Test-CrDeletable $ctx $r).Allowed | Should Be $true
+    }
+
+    It 'throws in sandbox mode when a path leaves the sandbox' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $ctx = New-TestContext $m $sys
+        { Assert-CrInSandbox $ctx 'C:\Windows\System32' } | Should Throw
+    }
+
+    It 'removes a junction as a link and never touches its target' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        $precious = Join-Path $m.Root 'precious'
+        New-FakeFile "$precious\keep.txt" 'keep'
+        $link = Join-Path $r 'Cache\link-to-precious'
+        cmd /c mklink /J "$link" "$precious" | Out-Null
+        ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) | Should Be ([IO.FileAttributes]::ReparsePoint)
+        Test-Path -LiteralPath "$link\keep.txt" | Should Be $true
+        $ctx = New-TestContext $m $sys
+
+        $res = Invoke-CrDelete $ctx "$r\Cache"
+        $res.Status | Should Be 'deleted'
+        Test-Path -LiteralPath "$r\Cache" | Should Be $false
+        Test-Path -LiteralPath "$precious\keep.txt" | Should Be $true
+    }
+
+    It 'logs a refusal and deletes nothing for a forbidden path' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        New-FakeClaudeCode $m
+        $ctx = New-TestContext $m $sys
+        $res = Invoke-CrDelete $ctx "$($m.Paths.UserProfile)\.claude"
+        $res.Status | Should Be 'refused'
+        Test-Path -LiteralPath "$($m.Paths.UserProfile)\.claude\CLAUDE.md" | Should Be $true
+        (Get-Content -LiteralPath (Join-Path $ctx.DataDir 'journal.log') -Raw) -match 'REFUSED' | Should Be $true
+    }
+}
+
+# ---------- 3. Reset levels ----------
+
+Describe 'Reset levels on Desktop data' {
+    function Invoke-Level($level) {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        New-FakeClaudeCode $m
+        $ctx = New-TestContext $m $sys
+        $before = Get-CrCodeSnapshot $ctx
+        $plan = Get-CrDesktopPlan $ctx -Level $level
+        $null = Invoke-CrPlan $ctx $plan
+        $after = Get-CrCodeSnapshot $ctx
+        return @{ Root = $r; Ctx = $ctx; Problems = @(Compare-CrCodeSnapshot $before $after); Plan = $plan }
+    }
+
+    It 'level 1 removes only caches' {
+        $t = Invoke-Level 1
+        $r = $t.Root
+        Test-Path -LiteralPath "$r\Cache" | Should Be $false
+        Test-Path -LiteralPath "$r\Code Cache" | Should Be $false
+        Test-Path -LiteralPath "$r\Partitions\cowork-file-preview\Cache" | Should Be $false
+        Test-Path -LiteralPath "$r\Partitions\cowork-file-preview\Local Storage" | Should Be $true
+        Test-Path -LiteralPath "$r\logs" | Should Be $true
+        Test-Path -LiteralPath "$r\config.json" | Should Be $true
+        $t.Problems.Count | Should Be 0
+    }
+
+    It 'level 2 signs Desktop out but keeps the MCP config and the VM' {
+        $t = Invoke-Level 2
+        $r = $t.Root
+        foreach ($gone in @('Cache', 'logs', 'config.json', 'Local State', 'Network', 'IndexedDB', 'ant-did', 'window-state.json', 'claude-code-sessions', 'git-shadow', 'Partitions')) {
+            Test-Path -LiteralPath "$r\$gone" | Should Be $false
+        }
+        Test-Path -LiteralPath "$r\claude_desktop_config.json" | Should Be $true
+        Test-Path -LiteralPath "$r\vm_bundles" | Should Be $true
+        Test-Path -LiteralPath "$r\claude-code" | Should Be $true
+        Test-Path -LiteralPath "$r\totally-new-thing.json" | Should Be $true
+        $t.Problems.Count | Should Be 0
+    }
+
+    It 'level 3 removes the whole data root and leaves Claude Code intact' {
+        $t = Invoke-Level 3
+        Test-Path -LiteralPath $t.Root | Should Be $false
+        $t.Problems.Count | Should Be 0
+        Test-Path -LiteralPath "$($t.Ctx.Paths.UserProfile)\.claude\.credentials.json" | Should Be $true
+    }
+}

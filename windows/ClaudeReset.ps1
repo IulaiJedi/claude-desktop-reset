@@ -130,6 +130,8 @@ function New-CrContext {
         DataDir     = $DataDir
         RunId       = (Get-Date).ToString('yyyyMMdd-HHmmss')
         Package     = $null
+        AllowCodeAuth = $false
+        ExtraAllowed  = @()
     }
     $ctx.Package = & $Sys.GetDesktopPackage
     return $ctx
@@ -237,6 +239,307 @@ function Get-CrDesktopInventory($ctx) {
         }
     }
     return @($items)
+}
+
+# ============================================================================
+#  Журнал
+# ============================================================================
+
+function Write-CrLog($ctx, [string]$Action, [string]$Path = '', [string]$Detail = '') {
+    if (-not [System.IO.Directory]::Exists($ctx.DataDir)) { [void][System.IO.Directory]::CreateDirectory($ctx.DataDir) }
+    $line = '{0} | {1} | {2} | {3}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Action, $Path, $Detail
+    $file = Join-Path $ctx.DataDir 'journal.log'
+    [System.IO.File]::AppendAllText($file, $line + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding $true))
+}
+
+# ============================================================================
+#  Защита удаления
+# ============================================================================
+
+function Get-CrFullPath([string]$Path) {
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
+function Test-CrUnder([string]$Path, [string]$Root) {
+    # true, если Path совпадает с Root или лежит внутри него (без учёта регистра).
+    $p = $Path.TrimEnd('\'); $r = $Root.TrimEnd('\')
+    return ($p -ieq $r) -or $p.StartsWith($r + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-CrInSandbox($ctx, [string]$Path) {
+    if ($ctx.SandboxRoot -and -not (Test-CrUnder (Get-CrFullPath $Path) $ctx.SandboxRoot)) {
+        throw "Песочница: путь вне корня песочницы — $Path"
+    }
+}
+
+function Get-CrCodeAuthPaths($ctx) {
+    # Точные пути следов входа Claude Code. Удаляются только в мастере «без следов».
+    $u = $ctx.Paths.UserProfile
+    $list = New-Object System.Collections.ArrayList
+    foreach ($rel in @('.claude\.credentials.json', '.claude\telemetry', '.claude\statsig', '.claude\mcp-needs-auth-cache.json',
+            '.claude\remote-settings.json', '.claude\policy-limits.json', '.claude.json.backup')) {
+        [void]$list.Add((Join-Path $u $rel))
+    }
+    foreach ($dir in @((Join-Path $u '.claude\backups'), $u)) {
+        if ([System.IO.Directory]::Exists($dir)) {
+            foreach ($f in (New-Object System.IO.DirectoryInfo $dir).GetFiles()) {
+                if ($f.Name -match '^\.claude\.json\.(backup|corrupted)\.') { [void]$list.Add($f.FullName) }
+            }
+        }
+    }
+    [void]$list.Add((Join-Path $ctx.Paths.AppData 'Anthropic'))
+    return @($list)
+}
+
+function Get-CrAllowedRoots($ctx) {
+    $p = $ctx.Paths
+    $roots = New-Object System.Collections.ArrayList
+    $pfns = @($script:CrKnownPfn)
+    if ($ctx.Package -and $ctx.Package.PackageFamilyName -ne $script:CrKnownPfn) { $pfns += $ctx.Package.PackageFamilyName }
+    foreach ($pfn in $pfns) {
+        $pkg = Join-Path $p.LocalAppData "Packages\$pfn"
+        $installed = $ctx.Package -and $ctx.Package.PackageFamilyName -eq $pfn
+        if ($installed) {
+            [void]$roots.Add((Join-Path $pkg 'LocalCache\Roaming\Claude'))
+            [void]$roots.Add((Join-Path $pkg 'LocalCache\Local\Claude'))
+        }
+        else { [void]$roots.Add($pkg) }   # пакет снят, осталась папка
+    }
+    foreach ($r in @((Join-Path $p.AppData 'Claude'), (Join-Path $p.LocalAppData 'Claude-Data'), (Join-Path $p.LocalAppData 'Claude-3p'),
+            (Join-Path $p.LocalAppData 'Claude\logs'), (Join-Path $p.ProgramData 'Claude'), (Join-Path $p.LocalAppData 'AnthropicClaude'),
+            (Join-Path $p.AppData 'Microsoft\Windows\Start Menu\Programs\Claude.lnk'), (Join-Path $p.Temp 'ClaudeSetup.log'))) {
+        [void]$roots.Add($r)
+    }
+    return @($roots)
+}
+
+function Test-CrDeletable($ctx, [string]$Path, [switch]$AllowCodeAuth) {
+    $full = Get-CrFullPath $Path
+    $p = $ctx.Paths
+    $codeAuth = @()
+    if ($AllowCodeAuth -or $ctx.AllowCodeAuth) { $codeAuth = @(Get-CrCodeAuthPaths $ctx | ForEach-Object { Get-CrFullPath $_ }) }
+    $isCodeAuth = [bool]($codeAuth | Where-Object { $_ -ieq $full })
+
+    # 1. Только внутри разрешённого корня или точный путь из разрешённого списка.
+    $extra = @()
+    if ($ctx.ExtraAllowed) { $extra = @($ctx.ExtraAllowed | ForEach-Object { Get-CrFullPath $_ }) }
+    $leaf = Split-Path -Leaf $full
+    $underRoot = [bool](Get-CrAllowedRoots $ctx | Where-Object { Test-CrUnder $full (Get-CrFullPath $_) })
+    $isMsixDownload = ((Split-Path -Parent $full) -ieq (Get-CrFullPath $p.Temp)) -and ($leaf -like 'Claude-*.msix')
+    if (-not ($underRoot -or $isCodeAuth -or $isMsixDownload -or ($extra -icontains $full))) {
+        return @{ Allowed = $false; Reason = 'вне разрешённых путей' }
+    }
+
+    # 2. Стоп-лист — даже внутри разрешённого корня.
+    $u = $p.UserProfile
+    if (-not $isCodeAuth) {
+        foreach ($deny in @((Join-Path $u '.claude'), (Join-Path $u '.local'), (Join-Path $p.LocalAppData 'wsl'))) {
+            if (Test-CrUnder $full (Get-CrFullPath $deny)) { return @{ Allowed = $false; Reason = "стоп-лист: $deny" } }
+        }
+        if ($leaf -like '.claude.json*' -and ((Split-Path -Parent $full) -ieq (Get-CrFullPath $u))) { return @{ Allowed = $false; Reason = 'стоп-лист: .claude.json' } }
+    }
+    $pkgs = Get-CrFullPath (Join-Path $p.LocalAppData 'Packages')
+    if (Test-CrUnder $full $pkgs) {
+        if ($full -ieq $pkgs) { return @{ Allowed = $false; Reason = 'стоп-лист: Packages' } }
+        $pfn = $full.Substring($pkgs.Length + 1).Split('\')[0]
+        $known = @($script:CrKnownPfn); if ($ctx.Package) { $known += $ctx.Package.PackageFamilyName }
+        if (-not ($known -icontains $pfn)) { return @{ Allowed = $false; Reason = "стоп-лист: чужой пакет $pfn" } }
+    }
+    $info = Get-CrItemInfo $full
+    if ($info -is [System.IO.DirectoryInfo] -and -not (Test-CrReparsePoint $info)) {
+        foreach ($marker in @('.git', 'CLAUDE.md')) {
+            if (Test-Path -LiteralPath (Join-Path $full $marker)) { return @{ Allowed = $false; Reason = "стоп-лист: внутри есть $marker" } }
+        }
+    }
+    return @{ Allowed = $true; Reason = '' }
+}
+
+function Remove-CrTree([string]$Path, [System.Collections.ArrayList]$Errors) {
+    # Удаляет каталог, не заходя в ссылки: ссылка удаляется как ссылка.
+    $info = Get-CrItemInfo $Path
+    if (-not $info) { return }
+    if ($info -is [System.IO.FileInfo]) {
+        try { $info.Attributes = [System.IO.FileAttributes]::Normal; $info.Delete() } catch { [void]$Errors.Add("$Path — $($_.Exception.Message)") }
+        return
+    }
+    if (Test-CrReparsePoint $info) {
+        try { [System.IO.Directory]::Delete($Path, $false) } catch { [void]$Errors.Add("$Path — $($_.Exception.Message)") }
+        return
+    }
+    $children = @()
+    try { $children = $info.GetFileSystemInfos() } catch { [void]$Errors.Add("$Path — $($_.Exception.Message)") }
+    foreach ($c in $children) { Remove-CrTree $c.FullName $Errors }
+    try { $info.Attributes = [System.IO.FileAttributes]::Directory; [System.IO.Directory]::Delete($Path, $false) } catch { [void]$Errors.Add("$Path — $($_.Exception.Message)") }
+}
+
+function Invoke-CrDelete($ctx, [string]$Path, [switch]$OnlyIfEmpty, [switch]$AllowCodeAuth) {
+    Assert-CrInSandbox $ctx $Path
+    $full = Get-CrFullPath $Path
+    $check = Test-CrDeletable $ctx $full -AllowCodeAuth:$AllowCodeAuth
+    if (-not $check.Allowed) {
+        Write-CrLog $ctx 'REFUSED' $full $check.Reason
+        return [pscustomobject]@{ Path = $full; Status = 'refused'; Bytes = 0; Error = $check.Reason }
+    }
+    $info = Get-CrItemInfo $full
+    if (-not $info) { return [pscustomobject]@{ Path = $full; Status = 'absent'; Bytes = 0; Error = '' } }
+    if ($OnlyIfEmpty -and $info -is [System.IO.DirectoryInfo] -and @($info.GetFileSystemInfos()).Count -gt 0) {
+        Write-CrLog $ctx 'KEPT' $full 'не пусто'
+        return [pscustomobject]@{ Path = $full; Status = 'kept'; Bytes = 0; Error = 'не пусто' }
+    }
+    $bytes = Get-CrSize $full
+    $errors = New-Object System.Collections.ArrayList
+    Remove-CrTree $full $errors
+    if ((Get-CrItemInfo $full) -or $errors.Count -gt 0) {
+        $msg = ($errors | Select-Object -First 3) -join '; '
+        Write-CrLog $ctx 'FAILED' $full $msg
+        return [pscustomobject]@{ Path = $full; Status = 'failed'; Bytes = $bytes - (Get-CrSize $full); Error = $msg }
+    }
+    Write-CrLog $ctx 'DELETED' $full (Format-CrSize $bytes)
+    return [pscustomobject]@{ Path = $full; Status = 'deleted'; Bytes = $bytes; Error = '' }
+}
+
+# ============================================================================
+#  Планы сброса Desktop
+# ============================================================================
+
+function Get-CrDesktopOutsideItems($ctx) {
+    # Данные Desktop вне его папки — переживают удаление приложения.
+    $p = $ctx.Paths
+    $items = New-Object System.Collections.ArrayList
+    $add = {
+        param($path, $purpose, [switch]$OnlyIfEmpty)
+        if (Get-CrItemInfo $path) {
+            $kind = if ($OnlyIfEmpty) { 'emptydir' } elseif ([System.IO.Directory]::Exists($path)) { 'dir' } else { 'file' }
+            [void]$items.Add((New-CrItem -Area 'desktop-outside' -RootKind 'outside' -Root $path -Path $path -Kind $kind -Group 'outside' -Purpose $purpose -Risk 'низкий' -Consequence 'Не нужно для работы; остаётся после удаления Desktop.'))
+        }
+    }
+    & $add (Join-Path $p.LocalAppData 'Claude\logs') 'Логи Desktop (вне пакета)'
+    & $add (Join-Path $p.LocalAppData 'Claude') 'Пустая папка Desktop' -OnlyIfEmpty
+    & $add (Join-Path $p.LocalAppData 'Claude-Data') 'Пустая папка переноса данных' -OnlyIfEmpty
+    & $add (Join-Path $p.ProgramData 'Claude\Logs') 'Логи службы Cowork (нужен администратор)'
+    & $add (Join-Path $p.ProgramData 'Claude') 'Пустая папка службы' -OnlyIfEmpty
+    & $add (Join-Path $p.Temp 'ClaudeSetup.log') 'Лог установщика'
+    if ([System.IO.Directory]::Exists($p.Temp)) {
+        foreach ($f in (New-Object System.IO.DirectoryInfo $p.Temp).GetFiles('Claude-*.msix')) { & $add $f.FullName 'Скачанный установщик' }
+    }
+    if (-not $ctx.Package) {
+        $orphan = Join-Path $p.LocalAppData "Packages\$($script:CrKnownPfn)"
+        & $add $orphan 'Папка снятого пакета Desktop'
+    }
+    return @($items)
+}
+
+function Get-CrDesktopPlan($ctx, [int]$Level, [switch]$IncludeLogs) {
+    $inv = @(Get-CrDesktopInventory $ctx)
+    $plan = New-Object System.Collections.ArrayList
+    switch ($Level) {
+        1 {
+            $groups = @('cache'); if ($IncludeLogs) { $groups += 'diag' }
+            foreach ($i in $inv) { if ($groups -contains $i.Group) { [void]$plan.Add($i) } }
+        }
+        2 {
+            foreach ($i in $inv) {
+                if (@('cache', 'diag', 'auth', 'settings', 'sessions') -contains $i.Group -and (Split-Path -Leaf $i.Path) -ne 'claude_desktop_config.json') { [void]$plan.Add($i) }
+            }
+        }
+        3 {
+            foreach ($root in (Get-CrDesktopRoots $ctx)) {
+                [void]$plan.Add((New-CrItem -Area 'desktop' -RootKind $root.Kind -Root $root.Path -Path $root.Path -Kind 'dir' -Group 'root' -Purpose "Все данные Desktop ($($root.Kind))" -Risk 'высокий' -Consequence 'Desktop как после первой установки: выход из аккаунта, без настроек и сессий.'))
+                if ($root.Kind -eq 'msix') {
+                    $local = Join-Path (Split-Path -Parent (Split-Path -Parent $root.Path)) 'Local\Claude'
+                    if (Get-CrItemInfo $local) { [void]$plan.Add((New-CrItem -Area 'desktop' -RootKind 'msix' -Root $local -Path $local -Kind 'dir' -Group 'root' -Purpose 'Локальные данные пакета' -Risk 'низкий')) }
+                }
+            }
+            foreach ($o in (Get-CrDesktopOutsideItems $ctx)) { [void]$plan.Add($o) }
+        }
+        default { throw "Нет такого уровня: $Level" }
+    }
+    return @(Optimize-CrPlan $plan)
+}
+
+function Optimize-CrPlan($plan) {
+    # Убирает пункты, лежащие внутри других пунктов плана.
+    $files = @($plan | Where-Object { @('dir', 'file', 'emptydir') -contains $_.Kind })
+    $rest = @($plan | Where-Object { -not (@('dir', 'file', 'emptydir') -contains $_.Kind) })
+    $keep = New-Object System.Collections.ArrayList
+    foreach ($i in $files) {
+        $inner = $files | Where-Object { $_ -ne $i -and $_.Kind -ne 'emptydir' -and -not ($_.Path -ieq $i.Path) -and (Test-CrUnder $i.Path $_.Path) }
+        if (-not $inner) { [void]$keep.Add($i) }
+    }
+    return @($keep) + $rest
+}
+
+function Invoke-CrPlan($ctx, $plan, [switch]$AllowCodeAuth) {
+    $results = New-Object System.Collections.ArrayList
+    # Сначала обычные пункты, потом «удалить, если опустела».
+    $ordered = @($plan | Where-Object { $_.Kind -ne 'emptydir' }) + @($plan | Where-Object { $_.Kind -eq 'emptydir' })
+    foreach ($i in $ordered) {
+        switch ($i.Kind) {
+            'emptydir' { [void]$results.Add((Invoke-CrDelete $ctx $i.Path -OnlyIfEmpty)) }
+            { @('dir', 'file') -contains $_ } { [void]$results.Add((Invoke-CrDelete $ctx $i.Path -AllowCodeAuth:$AllowCodeAuth)) }
+            default {
+                $handler = "Invoke-CrAction_$($i.Kind)"
+                if (Get-Command $handler -ErrorAction SilentlyContinue) { [void]$results.Add((& $handler $ctx $i)) }
+                else { [void]$results.Add([pscustomobject]@{ Path = $i.Path; Status = 'failed'; Bytes = 0; Error = "нет обработчика $($i.Kind)" }) }
+            }
+        }
+    }
+    return @($results)
+}
+
+# ============================================================================
+#  Снимок Claude Code — доказательство, что он не пострадал
+# ============================================================================
+
+function Get-CrFilesUnder([string]$Path, [string]$Filter = '*') {
+    $out = New-Object System.Collections.ArrayList
+    $info = Get-CrItemInfo $Path
+    if (-not ($info -is [System.IO.DirectoryInfo]) -or (Test-CrReparsePoint $info)) { return @() }
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($info)
+    while ($stack.Count -gt 0) {
+        $d = $stack.Pop()
+        try { $children = $d.GetFileSystemInfos() } catch { continue }
+        foreach ($c in $children) {
+            if (Test-CrReparsePoint $c) { continue }
+            if ($c -is [System.IO.DirectoryInfo]) { $stack.Push($c) } elseif ($c.Name -like $Filter) { [void]$out.Add($c) }
+        }
+    }
+    return @($out)
+}
+
+function Get-CrHash([string]$Path) {
+    if (-not [System.IO.File]::Exists($Path)) { return '' }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+function Get-CrCodeSnapshot($ctx) {
+    $c = Join-Path $ctx.Paths.UserProfile '.claude'
+    return @{
+        Transcripts = @(Get-CrFilesUnder (Join-Path $c 'projects') '*.jsonl').Count
+        MemoryFiles = @(Get-CrFilesUnder (Join-Path $c 'projects') '*.md').Count
+        Skills      = @(Get-CrFilesUnder (Join-Path $c 'skills')).Count
+        Agents      = @(Get-CrFilesUnder (Join-Path $c 'agents')).Count
+        Plugins     = @(Get-CrFilesUnder (Join-Path $c 'plugins')).Count
+        Settings    = Get-CrHash (Join-Path $c 'settings.json')
+        ClaudeMd    = Get-CrHash (Join-Path $c 'CLAUDE.md')
+        ClaudeJson  = [System.IO.File]::Exists((Join-Path $ctx.Paths.UserProfile '.claude.json'))
+        Credentials = [System.IO.File]::Exists((Join-Path $c '.credentials.json'))
+        CliBinary   = [System.IO.File]::Exists((Join-Path $ctx.Paths.UserProfile '.local\bin\claude.exe'))
+    }
+}
+
+function Compare-CrCodeSnapshot($Before, $After, [switch]$AuthWizard) {
+    $problems = New-Object System.Collections.ArrayList
+    foreach ($k in @('Transcripts', 'MemoryFiles', 'Skills', 'Agents', 'Plugins')) {
+        if ($After[$k] -lt $Before[$k]) { [void]$problems.Add("Claude Code: стало меньше файлов в $k ($($Before[$k]) -> $($After[$k]))") }
+    }
+    if ($Before.Settings -ne $After.Settings) { [void]$problems.Add('Claude Code: изменился settings.json') }
+    if ($Before.ClaudeMd -ne $After.ClaudeMd) { [void]$problems.Add('Claude Code: изменился глобальный CLAUDE.md') }
+    if ($Before.ClaudeJson -and -not $After.ClaudeJson) { [void]$problems.Add('Claude Code: пропал .claude.json') }
+    if ($Before.CliBinary -and -not $After.CliBinary) { [void]$problems.Add('Claude Code: пропала программа claude.exe') }
+    if (-not $AuthWizard -and $Before.Credentials -and -not $After.Credentials) { [void]$problems.Add('Claude Code: пропал вход (.credentials.json)') }
+    return @($problems)
 }
 
 # ============================================================================
