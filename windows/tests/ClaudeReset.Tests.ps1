@@ -596,3 +596,76 @@ Describe 'Uninstall and residue check' {
         Test-Path -LiteralPath "$($m.Paths.UserProfile)\.claude\projects\C--projects-a\s1.jsonl" | Should Be $true
     }
 }
+
+# ---------- 9. Menu flows, driven by scripted answers ----------
+
+Describe 'Menu flows (scripted answers)' {
+    function New-FullMachine {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        New-FakeClaudeCode $m
+        New-FakeFile "$($m.Paths.LocalAppData)\Claude\logs\main.log" 'log'
+        $sys.State.Registry['HKCU:\Software\Classes\claude'] = @{ '(default)' = 'URL:claude' }
+        $p = Join-Path $m.Paths.LocalAppData 'Google\Chrome\User Data\Default'
+        New-FakeFile "$p\Preferences" '{}'
+        New-FakeFile "$p\IndexedDB\https_claude.ai_0.indexeddb.leveldb\000003.log" 'idb'
+        return @{ M = $m; Sys = $sys; Root = $r; Ctx = (New-TestContext $m $sys) }
+    }
+    function Set-Answers([string[]]$a) { $global:CrAnswers = New-Object System.Collections.Queue; foreach ($x in $a) { $global:CrAnswers.Enqueue($x) } }
+
+    Mock Write-Host { }
+    Mock Read-Host { if ($global:CrAnswers.Count -eq 0) { throw "unexpected question: $Prompt" }; $global:CrAnswers.Dequeue() }
+
+    It 'audit runs end to end and saves a report' {
+        $t = New-FullMachine
+        Invoke-CrAudit $t.Ctx -NoPause
+        $rep = Get-ChildItem -LiteralPath (Join-Path $t.Ctx.DataDir 'reports') -Filter 'audit-*.txt'
+        @($rep).Count | Should Be 1
+        $text = Get-Content -LiteralPath $rep[0].FullName -Raw
+        $text -match 'claude_desktop_config.json' | Should Be $true
+        $text -match 'Следы Claude в браузерах' | Should Be $true
+        Test-Path -LiteralPath "$($t.Root)\config.json" | Should Be $true
+    }
+
+    It 'level 2: backup, confirm, sign-out of Desktop only' {
+        $t = New-FullMachine
+        Set-Answers @('да', 'да', '')
+        Invoke-CrLevelFlow $t.Ctx 2
+        Test-Path -LiteralPath "$($t.Root)\config.json" | Should Be $false
+        Test-Path -LiteralPath "$($t.Root)\claude_desktop_config.json" | Should Be $true
+        Test-Path -LiteralPath (Join-Path $t.Ctx.DataDir 'backup') | Should Be $true
+        Test-Path -LiteralPath "$($t.M.Paths.UserProfile)\.claude\.credentials.json" | Should Be $true
+        $global:CrAnswers.Count | Should Be 0
+    }
+
+    It 'level 3: a wrong confirmation word deletes nothing' {
+        $t = New-FullMachine
+        Set-Answers @('нет', 'нет', 'нет')
+        Invoke-CrLevelFlow $t.Ctx 3
+        Test-Path -LiteralPath "$($t.Root)\config.json" | Should Be $true
+        $t.Sys.State.Package | Should Not BeNullOrEmpty
+    }
+
+    It 'no-traces wizard: uninstall, wipe, keep the work' {
+        $t = New-FullMachine
+        Set-Answers @('нет', 'да', 'да', 'удалить', 'да', '')
+        Invoke-CrNoTracesWizard $t.Ctx
+        $u = $t.M.Paths.UserProfile
+        ($t.Sys.State.Log -join "`n") -match 'RemovePackage' | Should Be $true
+        Test-Path -LiteralPath $t.Root | Should Be $false
+        Test-Path -LiteralPath "$u\.claude\.credentials.json" | Should Be $false
+        Test-Path -LiteralPath "$u\.claude\projects\C--projects-a\s1.jsonl" | Should Be $true
+        Test-Path -LiteralPath "$u\.claude\CLAUDE.md" | Should Be $true
+        Test-Path -LiteralPath "$($t.M.Paths.LocalAppData)\Google\Chrome\User Data\Default\IndexedDB\https_claude.ai_0.indexeddb.leveldb" | Should Be $false
+        @(Get-ChildItem -LiteralPath (Join-Path $t.Ctx.DataDir 'backup') -Recurse -Filter 'mcpServers-*.json').Count | Should Be 1
+        Test-Path -LiteralPath (Join-Path $t.Ctx.DataDir "backup\$($t.Ctx.RunId)\claude-code") | Should Be $false
+        $global:CrAnswers.Count | Should Be 0
+    }
+
+    It 'menu dispatches and exits' {
+        $t = New-FullMachine
+        Set-Answers @('7', '', '42', '0')
+        Start-CrMenu $t.Ctx
+        $global:CrAnswers.Count | Should Be 0
+    }
+}

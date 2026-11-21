@@ -1140,6 +1140,442 @@ function Compare-CrCodeSnapshot($Before, $After, [switch]$AuthWizard) {
 }
 
 # ============================================================================
+#  Вывод на экран и в отчёт
+# ============================================================================
+
+$script:CrLines = New-Object System.Collections.ArrayList
+
+function Out-CrLine([string]$Text = '', [string]$Color = 'Gray') {
+    Write-Host $Text -ForegroundColor $Color
+    [void]$script:CrLines.Add($Text)
+}
+
+function Format-CrPath($ctx, [string]$Path) {
+    $p = $ctx.Paths
+    foreach ($pair in @(@($p.LocalAppData, '%LOCALAPPDATA%'), @($p.AppData, '%APPDATA%'), @($p.ProgramData, '%PROGRAMDATA%'), @($p.UserProfile, '%USERPROFILE%'))) {
+        if ($pair[0] -and $Path.StartsWith($pair[0], [System.StringComparison]::OrdinalIgnoreCase)) { return $pair[1] + $Path.Substring($pair[0].Length) }
+    }
+    return $Path
+}
+
+function Save-CrReport($ctx, [string]$Name, $Items) {
+    $dir = Join-Path $ctx.DataDir 'reports'
+    [void][System.IO.Directory]::CreateDirectory($dir)
+    $txt = Join-Path $dir "$Name-$($ctx.RunId).txt"
+    [System.IO.File]::WriteAllLines($txt, [string[]]$script:CrLines, (New-Object System.Text.UTF8Encoding $true))
+    if ($Items) {
+        $json = Join-Path $dir "$Name-$($ctx.RunId).json"
+        [System.IO.File]::WriteAllText($json, (@($Items) | Select-Object Area, RootKind, Path, Kind, Group, Purpose, Risk, Bytes, Consequence | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding $false))
+    }
+    $script:CrLines.Clear()
+    return $txt
+}
+
+function Show-CrPlan($ctx, $Plan, [string]$Title) {
+    Out-CrLine ''
+    Out-CrLine "== $Title ==" 'Cyan'
+    $n = 0; $total = [int64]0
+    foreach ($i in @($Plan)) {
+        $n++
+        $total += [Math]::Max([int64]0, [int64]$i.Bytes)
+        $size = if ($i.Bytes -gt 0) { Format-CrSize $i.Bytes } else { '' }
+        Out-CrLine ('{0,3}. {1}  [{2}]  {3}' -f $n, $i.Purpose, $i.Risk, $size) 'White'
+        $what = if ($i.Kind -eq 'userenv') { "переменная $($i.Path)" } elseif ($i.Kind -eq 'manual') { 'сделать вручную' } else { Format-CrPath $ctx $i.Path }
+        Out-CrLine "      $what" 'DarkGray'
+        if ($i.Consequence) { Out-CrLine "      Последствие: $($i.Consequence)" 'DarkGray' }
+    }
+    if ($n -eq 0) { Out-CrLine '  Ничего не найдено.' 'Green' }
+    else { Out-CrLine ("  Итого пунктов: {0}, объём: {1}" -f $n, (Format-CrSize $total)) 'Cyan' }
+}
+
+function Show-CrResults($ctx, $Results) {
+    $r = @($Results | Where-Object { $_ })
+    $freed = [int64](($r | Where-Object { $_.Status -eq 'deleted' } | Measure-Object -Property Bytes -Sum).Sum)
+    Out-CrLine ''
+    Out-CrLine ('Готово. Удалено: {0}, освобождено: {1}. Отказано защитой: {2}. Ошибок: {3}. Вручную: {4}.' -f
+        @($r | Where-Object { $_.Status -eq 'deleted' }).Count, (Format-CrSize $freed), @($r | Where-Object { $_.Status -eq 'refused' }).Count,
+        @($r | Where-Object { $_.Status -eq 'failed' }).Count, @($r | Where-Object { $_.Status -eq 'manual' }).Count) 'Green'
+    foreach ($x in ($r | Where-Object { @('failed', 'refused') -contains $_.Status })) {
+        Out-CrLine ("  {0}: {1} — {2}" -f $(if ($x.Status -eq 'failed') { 'ошибка' } else { 'отказ' }), (Format-CrPath $ctx $x.Path), $x.Error) 'Yellow'
+    }
+    foreach ($x in ($r | Where-Object { $_.Status -eq 'manual' })) { Out-CrLine "  Вручную: $($x.Error)" 'Yellow' }
+}
+
+# ============================================================================
+#  Вопросы человеку
+# ============================================================================
+
+function Read-CrYes([string]$Prompt) {
+    $a = Read-Host "$Prompt (да/нет)"
+    return @('да', 'д', 'y', 'yes', 'da') -contains ([string]$a).Trim().ToLowerInvariant()
+}
+
+function Read-CrWord([string]$Prompt) {
+    $a = Read-Host "$Prompt Чтобы подтвердить, введите слово УДАЛИТЬ"
+    return @('удалить', 'delete') -contains ([string]$a).Trim().ToLowerInvariant()
+}
+
+function Get-CrClaudeProcesses($ctx) {
+    $roots = @(Get-CrDesktopRoots $ctx | ForEach-Object { $_.Path })
+    $desktop = New-Object System.Collections.ArrayList; $code = New-Object System.Collections.ArrayList
+    foreach ($p in @(& $ctx.Sys.GetProcesses)) {
+        if ($p.Name -notmatch '^(?i)claude$|^cowork-svc$') { continue }
+        $path = [string]$p.Path
+        $isDesktop = (-not $path) -or ($path -match '(?i)\\WindowsApps\\Claude_|\\AnthropicClaude\\') -or [bool]($roots | Where-Object { $path.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) })
+        if ($p.Name -ieq 'cowork-svc') { continue }          # служба — отдельно
+        if ($isDesktop) { [void]$desktop.Add($p) } else { [void]$code.Add($p) }
+    }
+    return @{ Desktop = @($desktop); Code = @($code) }
+}
+
+function Wait-CrClosed($ctx, [switch]$Desktop, [switch]$Code, [switch]$Browsers) {
+    while ($true) {
+        $pr = Get-CrClaudeProcesses $ctx
+        $open = New-Object System.Collections.ArrayList
+        if ($Desktop -and $pr.Desktop.Count) { [void]$open.Add('Claude Desktop (меню ☰ → File → Exit; значок в трее тоже)') }
+        if ($Code -and $pr.Code.Count) { [void]$open.Add('Claude Code во всех терминалах — иначе он запишет данные входа обратно') }
+        if ($Browsers) {
+            $names = @(& $ctx.Sys.GetProcesses | ForEach-Object { $_.Name.ToLowerInvariant() })
+            foreach ($b in (Get-CrBrowserProfiles $ctx | Select-Object -ExpandProperty Browser -Unique)) {
+                $proc = ($script:CrBrowsers | Where-Object { $_.Name -eq $b } | Select-Object -First 1).Proc
+                if ($names -contains $proc) { [void]$open.Add($b) }
+            }
+        }
+        if ($open.Count -eq 0) { return $true }
+        Out-CrLine 'Сначала закройте:' 'Yellow'
+        foreach ($o in $open) { Out-CrLine "  - $o" 'Yellow' }
+        $a = Read-Host 'Закройте и нажмите Enter (q — отмена)'
+        if (([string]$a).Trim().ToLowerInvariant() -eq 'q') { return $false }
+    }
+}
+
+function Stop-CrCoworkService($ctx) {
+    $svc = & $ctx.Sys.GetService 'CoworkVMService'
+    if (-not $svc -or [string]$svc.Status -ne 'Running') { return }
+    if (-not (& $ctx.Sys.IsAdmin)) {
+        Out-CrLine 'Служба Cowork работает, а остановить её может только администратор. Файлы виртуальной машины могут не удалиться — проверка остатков их покажет. Чтобы убрать всё, запустите инструмент от имени администратора.' 'Yellow'
+        return
+    }
+    if (Read-CrYes 'Остановить службу Claude Cowork (CoworkVMService)?') {
+        try { & $ctx.Sys.StopService 'CoworkVMService'; Write-CrLog $ctx 'SERVICE-STOPPED' 'CoworkVMService' '' }
+        catch { Out-CrLine "Не удалось остановить службу: $($_.Exception.Message)" 'Yellow'; Write-CrLog $ctx 'FAILED' 'CoworkVMService' $_.Exception.Message }
+    }
+}
+
+# ============================================================================
+#  Аудит и диагностика — только чтение
+# ============================================================================
+
+function Get-CrCodeDiagnostics($ctx) {
+    $u = $ctx.Paths.UserProfile
+    $c = Join-Path $u '.claude'
+    $d = [ordered]@{}
+    $clis = @(& $ctx.Sys.FindClaudeCli)
+    $d['Установки CLI'] = if ($clis.Count) { $clis } else { @('не найдено') }
+    $d['Версии'] = @($clis | ForEach-Object { $r = & $ctx.Sys.RunProcess $_ @('--version'); "$_ → $(([string]$r.Output).Trim())" })
+    $old = @(Get-CrFilesUnder (Join-Path $u '.local\bin') 'claude.exe.old*')
+    if ($old.Count) { $d['Старые копии claude.exe'] = "$($old.Count) шт. в %USERPROFILE%\.local\bin (можно удалить вручную)" }
+    $vers = Join-Path $u '.local\share\claude\versions'
+    if ([System.IO.Directory]::Exists($vers)) { $d['Версии в .local\share\claude'] = @((New-Object System.IO.DirectoryInfo $vers).GetFileSystemInfos() | ForEach-Object { $_.Name }) -join ', ' }
+    $cred = Join-Path $c '.credentials.json'
+    $d['Вход CLI (.credentials.json)'] = if ([System.IO.File]::Exists($cred)) { $fi = New-Object System.IO.FileInfo $cred; "есть, $($fi.Length) Б, изменён $($fi.LastWriteTime.ToString('dd.MM.yyyy'))" } else { 'нет' }
+    $cj = Join-Path $u '.claude.json'
+    if ([System.IO.File]::Exists($cj)) {
+        try { $keys = @(Get-CrClaudeJsonStripKeys $cj); $d['.claude.json'] = "корректный JSON; ключей аккаунта и кэшей: $($keys.Count)" }
+        catch { $d['.claude.json'] = "НЕ читается как JSON: $($_.Exception.Message)" }
+    }
+    else { $d['.claude.json'] = 'нет' }
+    $st = Join-Path $c 'settings.json'
+    if ([System.IO.File]::Exists($st)) {
+        try { $null = (Get-CrJsonSerializer).DeserializeObject([System.IO.File]::ReadAllText($st)); $d['settings.json'] = 'корректный JSON' }
+        catch { $d['settings.json'] = "НЕ читается как JSON: $($_.Exception.Message)" }
+    }
+    $tr = @(Get-CrFilesUnder (Join-Path $c 'projects') '*.jsonl')
+    $d['Переписки'] = "$($tr.Count) файлов, $(Format-CrSize ([int64](($tr | Measure-Object Length -Sum).Sum)))"
+    $d['Временные файлы CLI (%TEMP%\claude)'] = Format-CrSize (Get-CrSize (Join-Path $ctx.Paths.Temp 'claude'))
+    $d['Логи MCP (claude-cli-nodejs)'] = Format-CrSize (Get-CrSize (Join-Path $ctx.Paths.LocalAppData 'claude-cli-nodejs'))
+    $envs = @($script:CrTokenEnvVars | Where-Object { & $ctx.Sys.GetUserEnv $_ })
+    $d['Переменные с токенами'] = if ($envs.Count) { $envs -join ', ' } else { 'нет' }
+    return $d
+}
+
+function Show-CrCodeDiagnostics($ctx) {
+    Out-CrLine ''
+    Out-CrLine '== Claude Code (не трогается при сбросе Desktop) ==' 'Cyan'
+    $d = Get-CrCodeDiagnostics $ctx
+    foreach ($k in $d.Keys) {
+        $v = @($d[$k])
+        Out-CrLine ("  {0}: {1}" -f $k, $v[0]) 'White'
+        foreach ($rest in ($v | Select-Object -Skip 1)) { Out-CrLine "      $rest" 'White' }
+    }
+}
+
+function Invoke-CrAudit($ctx, [switch]$NoPause) {
+    $script:CrLines.Clear()
+    Out-CrLine "ClaudeReset $($script:CrVersion) — аудит, $(Get-Date -Format 'dd.MM.yyyy HH:mm'). Ничего не меняется." 'Cyan'
+    Out-CrLine "Компьютер: $env:COMPUTERNAME   Профиль: $($ctx.Paths.UserProfile)   Администратор: $(if (& $ctx.Sys.IsAdmin) { 'да' } else { 'нет' })"
+    Out-CrLine ''
+    Out-CrLine '== Claude Desktop ==' 'Cyan'
+    if ($ctx.Package) { Out-CrLine "  Установлен пакетом Windows: $($ctx.Package.PackageFullName)" 'White' }
+    elseif ([System.IO.Directory]::Exists((Join-Path $ctx.Paths.LocalAppData 'AnthropicClaude'))) { Out-CrLine '  Установлен старым установщиком (%LOCALAPPDATA%\AnthropicClaude)' 'White' }
+    else { Out-CrLine '  Приложение не установлено' 'White' }
+    $svc = & $ctx.Sys.GetService 'CoworkVMService'
+    if ($svc) { Out-CrLine "  Служба Cowork (CoworkVMService): $($svc.Status)" 'White' }
+    $pr = Get-CrClaudeProcesses $ctx
+    if ($pr.Desktop.Count) { Out-CrLine "  Сейчас запущен: да ($($pr.Desktop.Count) процессов)" 'Yellow' }
+
+    $all = New-Object System.Collections.ArrayList
+    $inv = @(Get-CrDesktopInventory $ctx)
+    foreach ($root in (Get-CrDesktopRoots $ctx)) {
+        $mine = @($inv | Where-Object { $_.Root -eq $root.Path })
+        $sum = [int64](($mine | Where-Object { $_.Path -notlike '*\Partitions\*' } | Measure-Object Bytes -Sum).Sum)
+        Out-CrLine ''
+        Out-CrLine "  Данные ($($root.Kind)): $(Format-CrPath $ctx $root.Path) — $(Format-CrSize $sum)" 'White'
+        foreach ($g in @('cache', 'diag', 'auth', 'settings', 'sessions', 'runtime', 'other')) {
+            $gi = @($mine | Where-Object { $_.Group -eq $g })
+            if (-not $gi.Count) { continue }
+            $gs = [int64](($gi | Where-Object { $_.Path -notlike '*\Partitions\*\*' } | Measure-Object Bytes -Sum).Sum)
+            Out-CrLine ("    {0} [{1}] — {2}: {3}" -f $script:CrGroupInfo[$g].Title, $script:CrGroupInfo[$g].Risk, (Format-CrSize $gs), (($gi | ForEach-Object { Split-Path -Leaf $_.Path }) -join ', ')) 'Gray'
+        }
+        foreach ($i in $mine) { [void]$all.Add($i) }
+    }
+    if (-not $inv.Count) { Out-CrLine '  Данных Desktop нет.' 'Green' }
+
+    $outside = @(Get-CrDesktopOutsideItems $ctx) + @(Get-CrDesktopRegistryItems $ctx)
+    Show-CrPlan $ctx $outside 'Данные Desktop вне его папки (переживают удаление приложения)'
+    foreach ($i in $outside) { [void]$all.Add($i) }
+
+    Show-CrCodeDiagnostics $ctx
+    $auth = @(Get-CrCodeAuthPlan $ctx)
+    Show-CrPlan $ctx $auth 'Следы входа Claude Code (удаляются только в чистке «без следов»)'
+    $browser = @(Get-CrBrowserPlan $ctx)
+    Show-CrPlan $ctx $browser 'Следы Claude в браузерах'
+    $copies = @(Get-CrUserCopies $ctx)
+    Show-CrPlan $ctx $copies 'Ваши копии настроек Claude (только по отдельному «да»)'
+    foreach ($i in ($auth + $browser + $copies)) { [void]$all.Add($i) }
+
+    Out-CrLine ''
+    Out-CrLine '== Что сделает каждый пункт меню ==' 'Cyan'
+    foreach ($lv in 1..3) { $pl = @(Get-CrDesktopPlan $ctx -Level $lv); Out-CrLine ("  Уровень {0}: пунктов {1}, {2}" -f $lv, $pl.Count, (Format-CrSize ([int64](($pl | Measure-Object Bytes -Sum).Sum)))) }
+    $file = Save-CrReport $ctx 'audit' $all
+    Write-Host "Отчёт сохранён: $file" -ForegroundColor Green
+    Write-CrLog $ctx 'AUDIT' $file ''
+    if (-not $NoPause) { [void](Read-Host 'Enter — в меню') }
+}
+
+# ============================================================================
+#  Сценарии меню
+# ============================================================================
+
+function Invoke-CrLevelFlow($ctx, [int]$Level) {
+    $script:CrLines.Clear()
+    $includeLogs = $false
+    if ($Level -eq 1) { $includeLogs = Read-CrYes 'Удалить заодно логи и отчёты о сбоях Desktop?' }
+    $uninstall = $false
+    if ($Level -eq 3 -and ($ctx.Package -or [System.IO.Directory]::Exists((Join-Path $ctx.Paths.LocalAppData 'AnthropicClaude')))) {
+        $uninstall = Read-CrYes 'Удалить и само приложение Claude Desktop (для переустановки начисто)?'
+    }
+    $plan = @(Get-CrDesktopPlan $ctx -Level $Level -IncludeLogs:$includeLogs)
+    $titles = @{ 1 = 'Уровень 1 — кэш Desktop'; 2 = 'Уровень 2 — сброс состояния Desktop (выход из аккаунта)'; 3 = 'Уровень 3 — все данные Desktop' }
+    Show-CrPlan $ctx $plan $titles[$Level]
+    if (-not $plan.Count -and -not $uninstall) { [void](Read-Host 'Enter — в меню'); return }
+    Out-CrLine "Профиль: $($ctx.Paths.UserProfile). Claude Code, проекты и память не затрагиваются." 'White'
+    if ($Level -ge 2) {
+        if (Read-CrYes 'Сделать резервную копию настроек и сессий (без данных входа)?') {
+            $b = New-CrBackup $ctx -IncludeCoworkDisk:($Level -eq 3 -and (Read-CrYes 'Копировать и диск сессий Cowork (sessiondata.vhdx, до гигабайта)?'))
+            Out-CrLine "Копия: $($b.Dir) (файлов: $($b.Files), ошибок: $($b.Errors.Count))" 'Green'
+        }
+    }
+    $ok = if ($Level -eq 3) { Read-CrWord 'Удалить всё перечисленное?' } else { Read-CrYes 'Удалить перечисленное?' }
+    if (-not $ok) { Out-CrLine 'Отменено. Ничего не удалено.' 'Yellow'; Write-CrLog $ctx 'CANCELLED' "level $Level" ''; return }
+    Write-CrLog $ctx 'CONFIRMED' "level $Level" "пунктов: $($plan.Count)"
+    if (-not (Wait-CrClosed $ctx -Desktop)) { Out-CrLine 'Отменено.' 'Yellow'; return }
+    if ($Level -eq 3) { Stop-CrCoworkService $ctx }
+    $before = Get-CrCodeSnapshot $ctx
+    $results = New-Object System.Collections.ArrayList
+    if ($uninstall) { [void]$results.Add((Invoke-CrUninstallDesktop $ctx)); $plan = @(Get-CrDesktopPlan $ctx -Level 3) }
+    foreach ($x in (Invoke-CrPlan $ctx $plan)) { [void]$results.Add($x) }
+    Show-CrResults $ctx $results
+    foreach ($p in (Compare-CrCodeSnapshot $before (Get-CrCodeSnapshot $ctx))) { Out-CrLine "ВНИМАНИЕ: $p" 'Red' }
+    if ($Level -eq 3) { Show-CrResidue $ctx -NoPause }
+    $file = Save-CrReport $ctx "level$Level" $plan
+    Write-Host "Отчёт: $file" -ForegroundColor Green
+    [void](Read-Host 'Enter — в меню')
+}
+
+function Show-CrResidue($ctx, [switch]$NoTraces, [switch]$NoPause) {
+    $res = @(Get-CrResidue $ctx -NoTraces:$NoTraces)
+    Show-CrPlan $ctx $res 'Проверка остатков'
+    if ($ctx.Package) { Out-CrLine "  Приложение Claude Desktop установлено: $($ctx.Package.PackageFullName)" 'White' }
+    Out-CrLine '  Служебные записи Windows о пакете (уведомления, плитки, разрешения) убирает сама Windows и в счёт не идут.' 'DarkGray'
+    if (-not $NoPause) { $f = Save-CrReport $ctx 'residue' $res; Write-Host "Отчёт: $f" -ForegroundColor Green; [void](Read-Host 'Enter — в меню') }
+}
+
+function Invoke-CrNoTracesWizard($ctx) {
+    $script:CrLines.Clear()
+    Out-CrLine '== Чистка «без следов входа» ==' 'Cyan'
+    Out-CrLine 'Уходят: все данные Claude Desktop, вход Claude Code (переписки, CLAUDE.md, память, настройки остаются), следы сайтов Claude в браузерах.' 'White'
+    Out-CrLine ''
+    Out-CrLine 'Шаг 1. Выход на сервере.' 'Cyan'
+    Out-CrLine 'Удаление файлов не завершает вход на серверах Anthropic. Выход везде: claude.ai → Settings → Account → Log Out.' 'White'
+    Out-CrLine 'ВНИМАНИЕ: это выкинет из аккаунта ВСЕ ваши устройства — этот компьютер и остальные (веб, Desktop, Claude Code, Claude in Chrome).' 'Yellow'
+    Out-CrLine 'API-ключи отключаются отдельно: platform.claude.com/settings/keys. Для теста шаг можно пропустить.' 'White'
+    if (Read-CrYes 'Открыть claude.ai/settings в браузере?') { & $ctx.Sys.OpenUrl 'https://claude.ai/settings'; [void](Read-Host 'Выйдите из аккаунта и нажмите Enter') }
+    Write-CrLog $ctx 'WIZARD' 'step1' 'выход на сервере — показан'
+
+    Out-CrLine ''
+    Out-CrLine 'Шаг 2. Штатный выход Claude Code.' 'Cyan'
+    $cli = @(& $ctx.Sys.FindClaudeCli)
+    if ($cli.Count -and (Read-CrYes "Выполнить «claude auth logout» ($($cli[0]))?")) {
+        $r = Invoke-CrClaudeLogout $ctx
+        Out-CrLine "Код выхода: $($r.ExitCode). $(([string]$r.Output).Trim())" 'White'
+    }
+
+    Out-CrLine ''
+    Out-CrLine 'Шаг 3. Закрыть программы.' 'Cyan'
+    if (-not (Wait-CrClosed $ctx -Desktop -Code -Browsers)) { Out-CrLine 'Отменено. Ничего не удалено.' 'Yellow'; return }
+    $uninstall = $false
+    if ($ctx.Package -or [System.IO.Directory]::Exists((Join-Path $ctx.Paths.LocalAppData 'AnthropicClaude'))) {
+        $uninstall = Read-CrYes 'Удалить и само приложение Claude Desktop? Рекомендую: да — потом поставите начисто'
+    }
+    $mcp = Get-CrDesktopRoots $ctx | Where-Object { [System.IO.File]::Exists((Join-Path $_.Path 'claude_desktop_config.json')) }
+    if ($mcp -and (Read-CrYes 'Сохранить список MCP-серверов Desktop (без данных аккаунта)?')) {
+        $b = New-CrBackup $ctx -McpOnly; Out-CrLine "Сохранено: $($b.Dir)" 'Green'
+    }
+
+    $plan = @(Get-CrNoTracesPlan $ctx)
+    Show-CrPlan $ctx $plan 'Шаг 4. План чистки'
+    if (-not (Read-CrWord 'Удалить всё перечисленное?')) { Out-CrLine 'Отменено. Ничего не удалено.' 'Yellow'; Write-CrLog $ctx 'CANCELLED' 'no-traces' ''; return }
+    Write-CrLog $ctx 'CONFIRMED' 'no-traces' "пунктов: $($plan.Count)"
+    Stop-CrCoworkService $ctx
+    $before = Get-CrCodeSnapshot $ctx
+    $results = New-Object System.Collections.ArrayList
+    if ($uninstall) { [void]$results.Add((Invoke-CrUninstallDesktop $ctx)); $plan = @(Get-CrNoTracesPlan $ctx) }
+    foreach ($x in (Invoke-CrPlan $ctx $plan -AllowCodeAuth)) { [void]$results.Add($x) }
+    Show-CrResults $ctx $results
+    foreach ($p in (Compare-CrCodeSnapshot $before (Get-CrCodeSnapshot $ctx) -AuthWizard)) { Out-CrLine "ВНИМАНИЕ: $p" 'Red' }
+
+    Out-CrLine ''
+    Out-CrLine 'Шаг 5. То, что делается руками в браузере.' 'Cyan'
+    for ($round = 0; $round -lt 5; $round++) {
+        $manual = @(Get-CrBrowserPlan $ctx | Where-Object { $_.Kind -eq 'manual' })
+        if (-not $manual.Count) { Out-CrLine 'В браузерах следов Claude не осталось.' 'Green'; break }
+        foreach ($m in $manual) { Out-CrLine "  - $($m.Consequence): $($m.Purpose)" 'Yellow' }
+        $a = Read-Host 'Сделайте это, закройте браузер и нажмите Enter для повторной проверки (s — пропустить)'
+        if (([string]$a).Trim().ToLowerInvariant() -eq 's') { break }
+        $again = @(Get-CrBrowserPlan $ctx | Where-Object { $_.Kind -ne 'manual' })
+        if ($again.Count) { $null = Invoke-CrPlan $ctx $again }
+    }
+
+    $copies = @(Get-CrUserCopies $ctx)
+    if ($copies.Count) {
+        Out-CrLine ''
+        Out-CrLine 'Шаг 6. Ваши копии настроек Claude — похоже, с данными входа.' 'Cyan'
+        foreach ($c in $copies) {
+            if (Read-CrYes "Удалить $(Format-CrPath $ctx $c.Path) ($(Format-CrSize $c.Bytes))?") {
+                $ctx.ExtraAllowed = @($ctx.ExtraAllowed) + @($c.Path)
+                $r = Invoke-CrDelete $ctx $c.Path
+                Out-CrLine "  $($r.Status)" 'White'
+            }
+        }
+    }
+
+    Out-CrLine ''
+    Out-CrLine 'Шаг 7. Проверка остатков.' 'Cyan'
+    Show-CrResidue $ctx -NoTraces -NoPause
+    $orig = Join-Path $ctx.DataDir "backup\$($ctx.RunId)\claude-code"
+    if ([System.IO.Directory]::Exists($orig)) {
+        Out-CrLine "В $orig лежит исходный .claude.json — в нём данные аккаунта. Удалите его, когда убедитесь, что Claude Code работает." 'Yellow'
+        if (Read-CrYes 'Удалить его сейчас?') {
+            $err = New-Object System.Collections.ArrayList; Remove-CrTree $orig $err; Write-CrLog $ctx 'DELETED' $orig 'исходный .claude.json'
+        }
+    }
+    Out-CrLine ''
+    Out-CrLine 'Готово. Теперь Claude можно поставить и войти как впервые: https://claude.ai/download' 'Green'
+    $file = Save-CrReport $ctx 'no-traces' $plan
+    Write-Host "Отчёт: $file" -ForegroundColor Green
+    [void](Read-Host 'Enter — в меню')
+}
+
+function Invoke-CrReinstallFlow($ctx) {
+    $script:CrLines.Clear()
+    Out-CrLine '== Переустановка Claude Desktop ==' 'Cyan'
+    if (-not ($ctx.Package -or [System.IO.Directory]::Exists((Join-Path $ctx.Paths.LocalAppData 'AnthropicClaude')))) {
+        Out-CrLine 'Claude Desktop не установлен. Установите его с https://claude.ai/download' 'White'; [void](Read-Host 'Enter — в меню'); return
+    }
+    Out-CrLine 'Порядок: копия → удаление приложения (Windows может стереть и его данные) → проверка остатков → установка → сверка Claude Code.' 'White'
+    if (-not (Read-CrYes 'Начать?')) { return }
+    $b = New-CrBackup $ctx
+    Out-CrLine "Копия: $($b.Dir) (файлов: $($b.Files), ошибок: $($b.Errors.Count))" 'Green'
+    if (-not (Wait-CrClosed $ctx -Desktop)) { return }
+    Stop-CrCoworkService $ctx
+    $before = Get-CrCodeSnapshot $ctx
+    $u = Invoke-CrUninstallDesktop $ctx
+    Show-CrResults $ctx @($u)
+    if ($u.Status -eq 'failed') { Out-CrLine 'Удалить приложение не вышло. Попробуйте запустить инструмент от имени администратора.' 'Yellow'; [void](Read-Host 'Enter — в меню'); return }
+    Show-CrResidue $ctx -NoPause
+    $left = @(Get-CrDesktopPlan $ctx -Level 3)
+    if ($left.Count -and (Read-CrWord 'Убрать оставшиеся данные Desktop, чтобы поставить начисто?')) { Show-CrResults $ctx (Invoke-CrPlan $ctx $left) }
+    Out-CrLine 'Установите Claude Desktop: https://claude.ai/download — и нажмите Enter, когда установка закончится.' 'Cyan'
+    if (Read-CrYes 'Открыть страницу загрузки?') { & $ctx.Sys.OpenUrl 'https://claude.ai/download' }
+    [void](Read-Host 'Enter после установки')
+    $ctx.Package = & $ctx.Sys.GetDesktopPackage
+    Out-CrLine "Desktop: $(if ($ctx.Package) { $ctx.Package.PackageFullName } else { 'не найден' })" 'White'
+    $problems = @(Compare-CrCodeSnapshot $before (Get-CrCodeSnapshot $ctx))
+    if ($problems.Count) { foreach ($p in $problems) { Out-CrLine "ВНИМАНИЕ: $p" 'Red' } } else { Out-CrLine 'Claude Code не пострадал: переписки, настройки, навыки и вход на месте.' 'Green' }
+    $cfg = Get-ChildItem -LiteralPath $b.Dir -Recurse -Filter 'claude_desktop_config.json' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $newRoot = Get-CrDesktopRoots $ctx | Select-Object -First 1
+    if ($cfg -and $newRoot -and (Read-CrYes 'Вернуть настройки MCP-серверов Desktop из копии?')) {
+        Copy-Item -LiteralPath $cfg.FullName -Destination (Join-Path $newRoot.Path 'claude_desktop_config.json') -Force
+        Write-CrLog $ctx 'RESTORED' (Join-Path $newRoot.Path 'claude_desktop_config.json') ''
+        Out-CrLine 'Вернул. Перезапустите Claude Desktop.' 'Green'
+    }
+    $file = Save-CrReport $ctx 'reinstall' $null
+    Write-Host "Отчёт: $file" -ForegroundColor Green
+    [void](Read-Host 'Enter — в меню')
+}
+
+function Start-CrMenu($ctx) {
+    while ($true) {
+        Write-Host ''
+        Write-Host "ClaudeReset $($script:CrVersion) — Claude Desktop и Claude Code" -ForegroundColor Cyan
+        Write-Host "Профиль: $($ctx.Paths.UserProfile)   Администратор: $(if (& $ctx.Sys.IsAdmin) { 'да' } else { 'нет' })"
+        Write-Host "Журнал и копии: $($ctx.DataDir)"
+        Write-Host ''
+        Write-Host '  1. Аудит — ничего не меняет'
+        Write-Host '  2. Очистить кэш Desktop (уровень 1)'
+        Write-Host '  3. Сбросить состояние Desktop — выход из аккаунта (уровень 2)'
+        Write-Host '  4. Удалить все данные Desktop (уровень 3)'
+        Write-Host '  5. Чистка «без следов входа»: Desktop, вход Claude Code, браузеры'
+        Write-Host '  6. Переустановить Claude Desktop'
+        Write-Host '  7. Проверка остатков'
+        Write-Host '  8. Диагностика Claude Code — ничего не меняет'
+        Write-Host '  9. Открыть папку с журналом и отчётами'
+        Write-Host '  0. Выход'
+        $c = ([string](Read-Host 'Выберите')).Trim()
+        try {
+            switch ($c) {
+                '1' { Invoke-CrAudit $ctx }
+                '2' { Invoke-CrLevelFlow $ctx 1 }
+                '3' { Invoke-CrLevelFlow $ctx 2 }
+                '4' { Invoke-CrLevelFlow $ctx 3 }
+                '5' { Invoke-CrNoTracesWizard $ctx }
+                '6' { Invoke-CrReinstallFlow $ctx }
+                '7' { $script:CrLines.Clear(); Show-CrResidue $ctx -NoTraces }
+                '8' { $script:CrLines.Clear(); Show-CrCodeDiagnostics $ctx; $f = Save-CrReport $ctx 'diagnostics' $null; Write-Host "Отчёт: $f" -ForegroundColor Green; [void](Read-Host 'Enter — в меню') }
+                '9' { [void][System.IO.Directory]::CreateDirectory($ctx.DataDir); & $ctx.Sys.OpenUrl $ctx.DataDir }
+                '0' { return }
+                default { Write-Host 'Нет такого пункта.' -ForegroundColor Yellow }
+            }
+        }
+        catch {
+            Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red
+            Write-CrLog $ctx 'ERROR' $c $_.Exception.Message
+        }
+    }
+}
+
+# ============================================================================
 #  Точка входа
 # ============================================================================
 
