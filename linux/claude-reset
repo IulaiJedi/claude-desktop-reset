@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# ClaudeReset для Ubuntu/WSL. ./claude-reset — меню; ./claude-reset --audit — только аудит, ничего не меняет.
+exec python3 "$(dirname "$(readlink -f "$0")")/claude_reset.py" "$@"
