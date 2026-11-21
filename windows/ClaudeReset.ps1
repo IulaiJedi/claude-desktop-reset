@@ -203,14 +203,14 @@ function Get-CrDesktopRoots($ctx) {
 }
 
 function New-CrItem {
-    param($Area, $RootKind, $Root, $Path, $Kind, $Group, $Purpose, $Consequence, $Risk, [int64]$Bytes = -1)
+    param($Area, $RootKind, $Root, $Path, $Kind, $Group, $Purpose, $Consequence, $Risk, [int64]$Bytes = -1, $Detail = '')
     if ($Bytes -lt 0) { $Bytes = Get-CrSize $Path }
     if (-not $Risk -and $Group -and $script:CrGroupInfo.ContainsKey($Group)) { $Risk = $script:CrGroupInfo[$Group].Risk }
     if (-not $Consequence -and $Group -and $script:CrGroupInfo.ContainsKey($Group)) { $Consequence = $script:CrGroupInfo[$Group].Consequence }
     if (-not $Purpose -and $Group -and $script:CrGroupInfo.ContainsKey($Group)) { $Purpose = $script:CrGroupInfo[$Group].Title }
     return [pscustomobject]@{
         Area = $Area; RootKind = $RootKind; Root = $Root; Path = $Path; Kind = $Kind; Group = $Group
-        Purpose = $Purpose; Consequence = $Consequence; Risk = $Risk; Bytes = $Bytes
+        Purpose = $Purpose; Consequence = $Consequence; Risk = $Risk; Bytes = $Bytes; Detail = $Detail
     }
 }
 
@@ -337,8 +337,9 @@ function Test-CrDeletable($ctx, [string]$Path, [switch]$AllowCodeAuth, [switch]$
     $leaf = Split-Path -Leaf $full
     $underRoot = [bool](Get-CrAllowedRoots $ctx | Where-Object { Test-CrUnder $full (Get-CrFullPath $_) })
     $isMsixDownload = ((Split-Path -Parent $full) -ieq (Get-CrFullPath $p.Temp)) -and ($leaf -like 'Claude-*.msix')
+    $isBrowserSite = Test-CrBrowserSitePath $ctx $full
     $isEmptyOnly = $OnlyIfEmpty -and [bool](Get-CrEmptyOnlyDirs $ctx | Where-Object { (Get-CrFullPath $_) -ieq $full })
-    if (-not ($underRoot -or $isCodeAuth -or $isMsixDownload -or $isEmptyOnly -or ($extra -icontains $full))) {
+    if (-not ($underRoot -or $isCodeAuth -or $isMsixDownload -or $isEmptyOnly -or $isBrowserSite -or ($extra -icontains $full))) {
         return @{ Allowed = $false; Reason = 'вне разрешённых путей' }
     }
 
@@ -698,6 +699,238 @@ function Invoke-CrClaudeLogout($ctx) {
     $r = & $ctx.Sys.RunProcess $exe @('auth', 'logout')
     Write-CrLog $ctx 'LOGOUT' $exe ("код выхода $($r.ExitCode)")
     return @{ Ran = $true; Exe = $exe; ExitCode = $r.ExitCode; Output = $r.Output }
+}
+
+# ============================================================================
+#  SQLite через системную winsqlite3.dll (есть в Windows 10 и 11)
+# ============================================================================
+
+if (-not ('CrSqlite' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class CrSqlite {
+    const string D = "winsqlite3.dll";
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern int sqlite3_open_v2(byte[] f, out IntPtr db, int flags, IntPtr vfs);
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern int sqlite3_close_v2(IntPtr db);
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern int sqlite3_busy_timeout(IntPtr db, int ms);
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern int sqlite3_prepare_v2(IntPtr db, byte[] sql, int n, out IntPtr st, IntPtr tail);
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern int sqlite3_step(IntPtr st);
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern int sqlite3_finalize(IntPtr st);
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern int sqlite3_changes(IntPtr db);
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern IntPtr sqlite3_errmsg(IntPtr db);
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern IntPtr sqlite3_column_text(IntPtr st, int i);
+    [DllImport(D, CallingConvention = CallingConvention.StdCall)] static extern int sqlite3_column_bytes(IntPtr st, int i);
+    static byte[] U(string s) { return Encoding.UTF8.GetBytes(s + "\0"); }
+    static string Utf8(IntPtr p, int n) { if (p == IntPtr.Zero) return null; if (n < 0) { n = 0; while (Marshal.ReadByte(p, n) != 0) n++; } byte[] b = new byte[n]; Marshal.Copy(p, b, 0, n); return Encoding.UTF8.GetString(b); }
+    static IntPtr Open(string path, int flags) {
+        IntPtr db; int rc = sqlite3_open_v2(U(path), out db, flags, IntPtr.Zero);
+        if (rc != 0) { string m = Utf8(sqlite3_errmsg(db), -1); sqlite3_close_v2(db); throw new Exception("sqlite open " + rc + ": " + m); }
+        sqlite3_busy_timeout(db, 2000); return db;
+    }
+    static string Run(IntPtr db, string sql, bool wantText, out int changes) {
+        IntPtr st; int rc = sqlite3_prepare_v2(db, U(sql), -1, out st, IntPtr.Zero);
+        if (rc != 0) throw new Exception("sqlite prepare " + rc + ": " + Utf8(sqlite3_errmsg(db), -1));
+        string first = null; bool got = false;
+        try {
+            rc = sqlite3_step(st);
+            while (rc == 100) { if (wantText && !got) { first = Utf8(sqlite3_column_text(st, 0), sqlite3_column_bytes(st, 0)); got = true; } rc = sqlite3_step(st); }
+            if (rc != 101) throw new Exception("sqlite step " + rc + ": " + Utf8(sqlite3_errmsg(db), -1));
+        } finally { sqlite3_finalize(st); }
+        changes = sqlite3_changes(db); return first;
+    }
+    public static int Exec(string path, string sql, bool create) {
+        IntPtr db = Open(path, create ? 6 : 2); int ch;
+        try { Run(db, sql, false, out ch); return ch; } finally { sqlite3_close_v2(db); }
+    }
+    public static string Scalar(string path, string sql) {
+        IntPtr db = Open(path, 1); int ch;
+        try { return Run(db, sql, true, out ch); } finally { sqlite3_close_v2(db); }
+    }
+}
+'@
+}
+
+# ============================================================================
+#  Браузеры: следы сайтов Claude
+# ============================================================================
+
+$script:CrBrowsers = @(
+    @{ Name = 'Google Chrome'; Base = 'LocalAppData'; Dir = 'Google\Chrome\User Data'; Proc = 'chrome'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Google Chrome Beta'; Base = 'LocalAppData'; Dir = 'Google\Chrome Beta\User Data'; Proc = 'chrome'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Google Chrome Canary'; Base = 'LocalAppData'; Dir = 'Google\Chrome SxS\User Data'; Proc = 'chrome'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Microsoft Edge'; Base = 'LocalAppData'; Dir = 'Microsoft\Edge\User Data'; Proc = 'msedge'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Microsoft Edge Beta'; Base = 'LocalAppData'; Dir = 'Microsoft\Edge Beta\User Data'; Proc = 'msedge'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Microsoft Edge Dev'; Base = 'LocalAppData'; Dir = 'Microsoft\Edge Dev\User Data'; Proc = 'msedge'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Brave'; Base = 'LocalAppData'; Dir = 'BraveSoftware\Brave-Browser\User Data'; Proc = 'brave'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Vivaldi'; Base = 'LocalAppData'; Dir = 'Vivaldi\User Data'; Proc = 'vivaldi'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Chromium'; Base = 'LocalAppData'; Dir = 'Chromium\User Data'; Proc = 'chromium'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Яндекс Браузер'; Base = 'LocalAppData'; Dir = 'Yandex\YandexBrowser\User Data'; Proc = 'browser'; Family = 'chromium'; Multi = $true }
+    @{ Name = 'Opera'; Base = 'AppData'; Dir = 'Opera Software\Opera Stable'; Proc = 'opera'; Family = 'chromium'; Multi = $false }
+    @{ Name = 'Opera GX'; Base = 'AppData'; Dir = 'Opera Software\Opera GX Stable'; Proc = 'opera'; Family = 'chromium'; Multi = $false }
+    @{ Name = 'Firefox'; Base = 'AppData'; Dir = 'Mozilla\Firefox\Profiles'; Proc = 'firefox'; Family = 'firefox'; Multi = $true }
+)
+
+$script:CrSiteDataHowTo = @{
+    chromium = 'Откройте настройки браузера → Конфиденциальность и безопасность → Файлы cookie / Все разрешения и данные сайтов → найдите claude.ai, claude.com, anthropic.com → Удалить.'
+    firefox  = 'Настройки → Приватность и защита → Куки и данные сайтов → Управление данными → найдите claude.ai, claude.com, anthropic.com → Удалить выбранное.'
+}
+
+function Test-CrClaudeHost([string]$HostName) {
+    $h = $HostName.TrimStart('.').ToLowerInvariant()
+    foreach ($d in $script:CrClaudeDomains) { if ($h -eq $d -or $h.EndsWith('.' + $d)) { return $true } }
+    return $false
+}
+
+function Get-CrBrowserProfiles($ctx) {
+    $out = New-Object System.Collections.ArrayList
+    foreach ($b in $script:CrBrowsers) {
+        $base = $ctx.Paths[$b.Base]
+        $dir = Join-Path $base $b.Dir
+        if (-not [System.IO.Directory]::Exists($dir)) { continue }
+        $candidates = @()
+        if ($b.Family -eq 'firefox') { $candidates = @((New-Object System.IO.DirectoryInfo $dir).GetDirectories()) }
+        elseif ($b.Multi) { $candidates = @((New-Object System.IO.DirectoryInfo $dir).GetDirectories() | Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' -or $_.Name -eq 'Guest Profile' }) }
+        else { $candidates = @(New-Object System.IO.DirectoryInfo $dir) }
+        foreach ($c in $candidates) {
+            if (Test-CrReparsePoint $c) { continue }
+            [void]$out.Add([pscustomobject]@{ Browser = $b.Name; Family = $b.Family; Proc = $b.Proc; Dir = $c.FullName; Profile = $c.Name })
+        }
+    }
+    return @($out)
+}
+
+function Get-CrSiteHostFromFolder([string]$Family, [string]$Name) {
+    if ($Family -eq 'chromium' -and $Name -match '^https?_(?<h>.+?)_\d+\.indexeddb\.(leveldb|blob)$') { return $Matches.h }
+    if ($Family -eq 'firefox' -and $Name -match '^https?\+\+\+(?<h>[^\+\^]+)') { return $Matches.h }
+    return $null
+}
+
+function Get-CrExtensionLeftovers([string]$ProfileDir) {
+    $id = $script:CrChromeExtensionId
+    return @("Local Extension Settings\$id", "Sync Extension Settings\$id", "Managed Extension Settings\$id",
+        "IndexedDB\chrome-extension_${id}_0.indexeddb.leveldb", "IndexedDB\chrome-extension_${id}_0.indexeddb.blob") | ForEach-Object { Join-Path $ProfileDir $_ }
+}
+
+function Test-CrBrowserSitePath($ctx, [string]$Full) {
+    # Разрешено только: папка сайта Claude внутри профиля или остатки удалённого расширения Claude.
+    foreach ($pr in (Get-CrBrowserProfiles $ctx)) {
+        $root = Get-CrFullPath $pr.Dir
+        if (-not (Test-CrUnder $Full $root) -or ($Full -ieq $root)) { continue }
+        $parent = Split-Path -Parent $Full
+        $leaf = Split-Path -Leaf $Full
+        if ($pr.Family -eq 'chromium' -and $parent -ieq (Join-Path $root 'IndexedDB')) {
+            $h = Get-CrSiteHostFromFolder 'chromium' $leaf
+            if ($h -and (Test-CrClaudeHost $h)) { return $true }
+        }
+        if ($pr.Family -eq 'firefox' -and $parent -ieq (Join-Path $root 'storage\default')) {
+            $h = Get-CrSiteHostFromFolder 'firefox' $leaf
+            if ($h -and (Test-CrClaudeHost $h)) { return $true }
+        }
+        if ($pr.Family -eq 'chromium' -and -not [System.IO.Directory]::Exists((Join-Path $root "Extensions\$($script:CrChromeExtensionId)"))) {
+            if (Get-CrExtensionLeftovers $root | Where-Object { (Get-CrFullPath $_) -ieq $Full }) { return $true }
+        }
+    }
+    return $false
+}
+
+function Get-CrSqlPredicate([string]$Detail) {
+    $parts = foreach ($d in $script:CrClaudeDomains) {
+        switch ($Detail) {
+            'chromium-cookies' { "host_key = '$d' OR host_key = '.$d' OR host_key LIKE '%.$d'" }
+            'firefox-cookies' { "host = '$d' OR host = '.$d' OR host LIKE '%.$d'" }
+            'firefox-webapps' { $rev = -join ($d.ToCharArray()[($d.Length - 1)..0]); "originKey LIKE '$rev.%'" }
+        }
+    }
+    return '(' + ($parts -join ' OR ') + ')'
+}
+
+$script:CrSqlTable = @{ 'chromium-cookies' = 'cookies'; 'firefox-cookies' = 'moz_cookies'; 'firefox-webapps' = 'webappsstore2' }
+
+function Find-CrClaudeInFiles([string]$Dir) {
+    # Ищет упоминание сайтов Claude в файлах базы (Local Storage, Service Worker) — только чтение.
+    $rx = '(?i)https?://([a-z0-9-]+\.)*(' + (($script:CrClaudeDomains | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')(?![a-z0-9.-])'
+    $enc = [System.Text.Encoding]::GetEncoding(28591)
+    foreach ($f in (Get-CrFilesUnder $Dir)) {
+        if ($f.Length -gt 64MB) { continue }
+        try { if ($enc.GetString([System.IO.File]::ReadAllBytes($f.FullName)) -match $rx) { return $true } } catch { }
+    }
+    return $false
+}
+
+function Get-CrBrowserPlan($ctx) {
+    $items = New-Object System.Collections.ArrayList
+    $running = @(& $ctx.Sys.GetProcesses | ForEach-Object { $_.Name.ToLowerInvariant() } | Sort-Object -Unique)
+    $manual = {
+        param($pr, $text)
+        [void]$items.Add((New-CrItem -Area 'browser' -RootKind $pr.Browser -Root $pr.Dir -Path $pr.Dir -Kind 'manual' -Group 'browser' -Purpose $text -Risk 'вход' -Consequence "$($pr.Browser), профиль «$($pr.Profile)»" -Bytes 0))
+    }
+    foreach ($pr in (Get-CrBrowserProfiles $ctx)) {
+        $d = $pr.Dir
+        if ($running -contains $pr.Proc) { & $manual $pr "Закройте $($pr.Browser) и повторите — открытый браузер держит свои базы."; continue }
+        $dbs = @()
+        if ($pr.Family -eq 'chromium') {
+            $cookie = @((Join-Path $d 'Network\Cookies'), (Join-Path $d 'Cookies')) | Where-Object { [System.IO.File]::Exists($_) } | Select-Object -First 1
+            if ($cookie) { $dbs += , @($cookie, 'chromium-cookies') }
+        }
+        else {
+            if ([System.IO.File]::Exists((Join-Path $d 'cookies.sqlite'))) { $dbs += , @((Join-Path $d 'cookies.sqlite'), 'firefox-cookies') }
+            if ([System.IO.File]::Exists((Join-Path $d 'webappsstore.sqlite'))) { $dbs += , @((Join-Path $d 'webappsstore.sqlite'), 'firefox-webapps') }
+        }
+        foreach ($pair in $dbs) {
+            $db = $pair[0]; $detail = $pair[1]
+            try {
+                $n = [int]([CrSqlite]::Scalar($db, "SELECT count(*) FROM $($script:CrSqlTable[$detail]) WHERE $(Get-CrSqlPredicate $detail);"))
+                if ($n -gt 0) { [void]$items.Add((New-CrItem -Area 'browser' -RootKind $pr.Browser -Root $d -Path $db -Kind 'sqlrows' -Group 'browser' -Purpose "Записи сайтов Claude: $n ($($pr.Browser), $($pr.Profile))" -Risk 'вход' -Consequence 'Выход с claude.ai в этом браузере.' -Bytes 0 -Detail $detail)) }
+            }
+            catch { & $manual $pr "Не удалось прочитать $(Split-Path -Leaf $db): $($_.Exception.Message)" }
+        }
+        $siteParent = if ($pr.Family -eq 'chromium') { Join-Path $d 'IndexedDB' } else { Join-Path $d 'storage\default' }
+        if ([System.IO.Directory]::Exists($siteParent)) {
+            foreach ($e in (New-Object System.IO.DirectoryInfo $siteParent).GetDirectories()) {
+                $h = Get-CrSiteHostFromFolder $pr.Family $e.Name
+                if ($h -and (Test-CrClaudeHost $h)) { [void]$items.Add((New-CrItem -Area 'browser' -RootKind $pr.Browser -Root $d -Path $e.FullName -Kind 'dir' -Group 'browser' -Purpose "Данные сайта $h ($($pr.Browser), $($pr.Profile))" -Risk 'вход' -Consequence 'Сайт забудет локальные данные.')) }
+            }
+        }
+        if ($pr.Family -eq 'chromium') {
+            if ([System.IO.Directory]::Exists((Join-Path $d "Extensions\$($script:CrChromeExtensionId)"))) {
+                & $manual $pr "Удалите расширение Claude в $($pr.Browser): меню → Расширения → Claude → Удалить. Потом запустите чистку ещё раз — остатки уберёт инструмент."
+            }
+            else {
+                foreach ($l in (Get-CrExtensionLeftovers $d)) { if (Get-CrItemInfo $l) { [void]$items.Add((New-CrItem -Area 'browser' -RootKind $pr.Browser -Root $d -Path $l -Kind 'dir' -Group 'browser' -Purpose 'Остатки данных расширения Claude' -Risk 'вход')) } }
+            }
+            $storage = @('Local Storage', 'Session Storage', 'Service Worker') | Where-Object { Find-CrClaudeInFiles (Join-Path $d $_) }
+            if ($storage) { & $manual $pr ("Следы Claude в «$($storage -join '», «')». Их безопасно убирает только сам браузер. " + $script:CrSiteDataHowTo.chromium) }
+        }
+    }
+    return @($items)
+}
+
+function Invoke-CrAction_sqlrows($ctx, $item) {
+    $db = Get-CrFullPath $item.Path
+    Assert-CrInSandbox $ctx $db
+    $okLeaf = @{ 'chromium-cookies' = @('Cookies'); 'firefox-cookies' = @('cookies.sqlite'); 'firefox-webapps' = @('webappsstore.sqlite') }
+    $known = Get-CrBrowserProfiles $ctx | Where-Object { Test-CrUnder $db (Get-CrFullPath $_.Dir) }
+    if (-not $known -or -not $script:CrSqlTable.ContainsKey($item.Detail) -or -not ($okLeaf[$item.Detail] -contains (Split-Path -Leaf $db))) {
+        Write-CrLog $ctx 'REFUSED' $db 'не база браузера'
+        return [pscustomobject]@{ Path = $db; Status = 'refused'; Bytes = 0; Error = 'не база браузера' }
+    }
+    try {
+        $n = [CrSqlite]::Exec($db, "DELETE FROM $($script:CrSqlTable[$item.Detail]) WHERE $(Get-CrSqlPredicate $item.Detail);", $false)
+        [void][CrSqlite]::Exec($db, 'VACUUM;', $false)      # стирает удалённое и из свободных страниц файла
+        Write-CrLog $ctx 'SQL-DELETED' $db "$n записей ($($item.Detail))"
+        return [pscustomobject]@{ Path = $db; Status = 'deleted'; Bytes = 0; Error = "$n записей" }
+    }
+    catch {
+        Write-CrLog $ctx 'FAILED' $db $_.Exception.Message
+        return [pscustomobject]@{ Path = $db; Status = 'failed'; Bytes = 0; Error = $_.Exception.Message }
+    }
+}
+
+function Invoke-CrAction_manual($ctx, $item) {
+    Write-CrLog $ctx 'MANUAL' $item.Root $item.Purpose
+    return [pscustomobject]@{ Path = $item.Root; Status = 'manual'; Bytes = 0; Error = $item.Purpose }
 }
 
 # ============================================================================

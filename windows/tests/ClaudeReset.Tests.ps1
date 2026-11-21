@@ -420,3 +420,103 @@ Describe 'Claude Code sign-in cleanup' {
         ($t.Sys.State.Log -join "`n") -match 'Run C:\\Users\\u\\.local\\bin\\claude.exe auth logout' | Should Be $true
     }
 }
+
+# ---------- 6. Browsers ----------
+
+Describe 'Browser traces of Claude' {
+    function New-ChromiumProfile($m, [string]$UserData = 'Google\Chrome\User Data', [string]$Profile = 'Default') {
+        $p = Join-Path $m.Paths.LocalAppData "$UserData\$Profile"
+        New-FakeFile "$p\Preferences" '{}'
+        $db = "$p\Network\Cookies"
+        [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $db))
+        [void][CrSqlite]::Exec($db, "CREATE TABLE cookies(host_key TEXT, name TEXT, encrypted_value BLOB);", $true)
+        foreach ($h in @('.claude.ai', 'claude.ai', 'platform.claude.com', '.anthropic.com', 'a.claudeusercontent.com', 'notclaude.ai', '.google.com')) {
+            [void][CrSqlite]::Exec($db, "INSERT INTO cookies VALUES('$h','sid',x'00');", $false)
+        }
+        New-FakeFile "$p\IndexedDB\https_claude.ai_0.indexeddb.leveldb\000003.log" 'idb'
+        New-FakeFile "$p\IndexedDB\https_claude.ai_0.indexeddb.blob\1\00\1" 'blob'
+        New-FakeFile "$p\IndexedDB\https_platform.claude.com_0.indexeddb.leveldb\000003.log" 'idb'
+        New-FakeFile "$p\IndexedDB\https_mail.google.com_0.indexeddb.leveldb\000003.log" 'keep'
+        New-FakeFile "$p\Local Storage\leveldb\000003.log" "META:https://claude.ai`0_https://claude.ai`0`1lastOrg"
+        return $p
+    }
+
+    It 'deletes only Claude cookies and Claude site folders, and lists what needs the browser button' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $p = New-ChromiumProfile $m
+        $ctx = New-TestContext $m $sys
+
+        $plan = @(Get-CrBrowserPlan $ctx)
+        $res = @(Invoke-CrPlan $ctx $plan)
+
+        $left = [CrSqlite]::Scalar("$p\Network\Cookies", "SELECT group_concat(host_key, ',') FROM (SELECT host_key FROM cookies ORDER BY host_key);")
+        $left | Should Be '.google.com,notclaude.ai'
+        $raw = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes("$p\Network\Cookies"))
+        $raw -match 'platform\.claude\.com' | Should Be $false      # VACUUM wiped the freed pages too
+        Test-Path -LiteralPath "$p\IndexedDB\https_claude.ai_0.indexeddb.leveldb" | Should Be $false
+        Test-Path -LiteralPath "$p\IndexedDB\https_claude.ai_0.indexeddb.blob" | Should Be $false
+        Test-Path -LiteralPath "$p\IndexedDB\https_platform.claude.com_0.indexeddb.leveldb" | Should Be $false
+        Test-Path -LiteralPath "$p\IndexedDB\https_mail.google.com_0.indexeddb.leveldb" | Should Be $true
+        Test-Path -LiteralPath "$p\Local Storage\leveldb\000003.log" | Should Be $true
+        @($res | Where-Object { $_.Status -eq 'manual' }).Count | Should Be 1
+    }
+
+    It 'does not edit a browser that is running' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $p = New-ChromiumProfile $m
+        $sys.State.Processes = @([pscustomobject]@{ Name = 'chrome'; Id = 1; Path = 'C:\Program Files\Google\Chrome\Application\chrome.exe' })
+        $ctx = New-TestContext $m $sys
+        $plan = @(Get-CrBrowserPlan $ctx)
+        @($plan | Where-Object { $_.Kind -ne 'manual' }).Count | Should Be 0
+        [CrSqlite]::Scalar("$p\Network\Cookies", 'SELECT count(*) FROM cookies;') | Should Be 7
+    }
+
+    It 'waits for the user to remove the Claude extension, then removes its leftovers' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $p = New-ChromiumProfile $m -UserData 'Microsoft\Edge\User Data' -Profile 'Profile 1'
+        $id = 'fcoeoabgfenejglbffodgkkbkcdhcgfn'
+        New-FakeFile "$p\Extensions\$id\1.0_0\manifest.json" '{"name":"Claude"}'
+        New-FakeFile "$p\Local Extension Settings\$id\000003.log" 'ext'
+        New-FakeFile "$p\IndexedDB\chrome-extension_${id}_0.indexeddb.leveldb\000003.log" 'ext'
+        $ctx = New-TestContext $m $sys
+
+        $null = Invoke-CrPlan $ctx @(Get-CrBrowserPlan $ctx)
+        Test-Path -LiteralPath "$p\Local Extension Settings\$id" | Should Be $true
+        Remove-Item -LiteralPath "$p\Extensions\$id" -Recurse -Force        # the user removed it in the browser
+        $null = Invoke-CrPlan $ctx @(Get-CrBrowserPlan $ctx)
+        Test-Path -LiteralPath "$p\Local Extension Settings\$id" | Should Be $false
+        Test-Path -LiteralPath "$p\IndexedDB\chrome-extension_${id}_0.indexeddb.leveldb" | Should Be $false
+    }
+
+    It 'cleans Firefox cookies and per-site storage' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $p = Join-Path $m.Paths.AppData 'Mozilla\Firefox\Profiles\abcd.default-release'
+        New-FakeFile "$p\prefs.js" ''
+        [void][CrSqlite]::Exec("$p\cookies.sqlite", 'CREATE TABLE moz_cookies(host TEXT, name TEXT);', $true)
+        foreach ($h in @('.claude.ai', 'claude.com', 'example.com')) { [void][CrSqlite]::Exec("$p\cookies.sqlite", "INSERT INTO moz_cookies VALUES('$h','x');", $false) }
+        [void][CrSqlite]::Exec("$p\webappsstore.sqlite", 'CREATE TABLE webappsstore2(originKey TEXT, key TEXT, value TEXT);', $true)
+        foreach ($o in @('ia.edualc.:https:443', 'ia.edualc.mroftalp.:https:443', 'ia.edualcton.:https:443')) { [void][CrSqlite]::Exec("$p\webappsstore.sqlite", "INSERT INTO webappsstore2 VALUES('$o','k','v');", $false) }
+        New-FakeFile "$p\storage\default\https+++claude.ai\ls\data.sqlite" 'ls'
+        New-FakeFile "$p\storage\default\https+++claude.ai^userContextId=1\ls\data.sqlite" 'ls'
+        New-FakeFile "$p\storage\default\https+++example.com\ls\data.sqlite" 'keep'
+        $ctx = New-TestContext $m $sys
+
+        $null = Invoke-CrPlan $ctx @(Get-CrBrowserPlan $ctx)
+        [CrSqlite]::Scalar("$p\cookies.sqlite", 'SELECT group_concat(host) FROM moz_cookies;') | Should Be 'example.com'
+        [CrSqlite]::Scalar("$p\webappsstore.sqlite", 'SELECT group_concat(originKey) FROM webappsstore2;') | Should Be 'ia.edualcton.:https:443'
+        Test-Path -LiteralPath "$p\storage\default\https+++claude.ai" | Should Be $false
+        Test-Path -LiteralPath "$p\storage\default\https+++claude.ai^userContextId=1" | Should Be $false
+        Test-Path -LiteralPath "$p\storage\default\https+++example.com" | Should Be $true
+    }
+
+    It 'never allows deleting a whole profile or another site''s folder' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $p = New-ChromiumProfile $m
+        $ctx = New-TestContext $m $sys
+        (Test-CrDeletable $ctx $p).Allowed | Should Be $false
+        (Test-CrDeletable $ctx "$p\IndexedDB").Allowed | Should Be $false
+        (Test-CrDeletable $ctx "$p\IndexedDB\https_mail.google.com_0.indexeddb.leveldb").Allowed | Should Be $false
+        (Test-CrDeletable $ctx "$p\Local Storage").Allowed | Should Be $false
+        (Test-CrDeletable $ctx "$p\IndexedDB\https_claude.ai_0.indexeddb.leveldb").Allowed | Should Be $true
+    }
+}
