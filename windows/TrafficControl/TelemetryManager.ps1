@@ -10,7 +10,8 @@ $script:TcSafeEnv = [ordered]@{
 $script:TcStrictEnv = [ordered]@{}
 foreach ($k in $script:TcSafeEnv.Keys) { $script:TcStrictEnv[$k] = $script:TcSafeEnv[$k] }
 $script:TcStrictEnv['DISABLE_TELEMETRY'] = '1'   # метрики; выключает и загрузку флагов функций
-$script:TcTokenNames = @('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN')
+# Если в settings.json похоже на секрет — полную копию файла не храним, откат будет точечным.
+$script:TcSecretPattern = '(?i)(token|secret|password|passwd|api[_-]?key|credential|bearer)'
 
 function Get-TcSettingsTargets($ctx) {
     # Файлы настроек Claude Code: Windows и каждый дистрибутив WSL, где есть ~/.claude.
@@ -96,7 +97,7 @@ function Set-TcEnv($ctx, $Target, $Desired) {
         $prev = @{}
         $hadEnv = $obj.ContainsKey('env') -and ($obj['env'] -is [System.Collections.Generic.IDictionary[string, object]])
         foreach ($k in $script:TcStrictEnv.Keys) { if ($hadEnv -and $obj['env'].ContainsKey($k)) { $prev[$k] = [string]$obj['env'][$k] } }
-        $hasToken = [bool]($script:TcTokenNames | Where-Object { $text.Contains($_) })
+        $hasToken = $text -match $script:TcSecretPattern
         $orig[$path] = @{ where = $Target.Where; existed = $existed; hadEnv = $hadEnv; prev = $prev; text = $(if ($hasToken) { $null } else { $text }); written = '' }
     }
     $rec = $orig[$path]
@@ -108,12 +109,23 @@ function Set-TcEnv($ctx, $Target, $Desired) {
     }
     $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
     $new = ConvertTo-TcJsonText $obj $nl
-    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $path))
-    [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding $false))
     $rec['written'] = Get-TcTextHash $new
     $orig[$path] = $rec
-    Save-TcOriginals $ctx $orig
+    Save-TcOriginals $ctx $orig                     # сначала исходник, потом правка файла
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+    Write-TcFileSafe $path $new
     Write-TcLog $ctx 'ENV-SET' $path (($Desired.Keys | ForEach-Object { "$_=$($Desired[$_])" }) -join ', ')
+}
+
+function Write-TcFileSafe([string]$Path, [string]$Text) {
+    # Через временный файл: оборванная запись не оставит полфайла настроек.
+    $tmp = "$Path.tc-tmp"
+    [System.IO.File]::WriteAllText($tmp, $Text, (New-Object System.Text.UTF8Encoding $false))
+    if ([System.IO.File]::Exists($Path)) {
+        try { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+        catch { [System.IO.File]::Copy($tmp, $Path, $true); [System.IO.File]::Delete($tmp) }   # на дисках WSL Replace может не работать
+    }
+    else { [System.IO.File]::Move($tmp, $Path) }
 }
 
 function Get-TcTextHash([string]$Text) {
@@ -124,20 +136,25 @@ function Get-TcTextHash([string]$Text) {
 function Restore-TcEnv($ctx) {
     $orig = Get-TcOriginals $ctx
     $notes = New-Object System.Collections.ArrayList
-    foreach ($path in @($orig.Keys)) {
+    foreach ($path in @($orig.Keys | Where-Object { $_ -notlike 'service:*' })) {
         $rec = $orig[$path]
         try {
+            $where = [string]$rec['where']
+            if ($where -like 'WSL *') { $null = & $ctx.Sys.WslHome $where.Substring(4) }   # дистрибутив должен быть доступен
             Assert-CrInSandbox $ctx $path
             $current = if ([System.IO.File]::Exists($path)) { [System.IO.File]::ReadAllText($path) } else { $null }
-            if ($null -ne $current -and (Get-TcTextHash $current) -eq $rec['written'] -and ($null -ne $rec['text'] -or -not $rec['existed'])) {
-                # Файл не менялся после модуля — возвращаем байт в байт.
-                if ($rec['existed']) { [System.IO.File]::WriteAllText($path, [string]$rec['text'], (New-Object System.Text.UTF8Encoding $false)) }
-                else { [System.IO.File]::Delete($path) }
+            $haveText = $null -ne $rec['text']
+            if ($null -eq $current) {
+                if ($rec['existed'] -and $haveText) { Write-TcFileSafe $path ([string]$rec['text']) }
+                elseif ($rec['existed']) { throw 'файла настроек нет, а полной копии исходника модуль не хранил' }
             }
-            elseif ($null -ne $current) {
+            elseif ((Get-TcTextHash $current) -eq $rec['written'] -and ($haveText -or -not $rec['existed'])) {
+                # Файл не менялся после модуля — возвращаем байт в байт.
+                if ($rec['existed']) { Write-TcFileSafe $path ([string]$rec['text']) } else { [System.IO.File]::Delete($path) }
+            }
+            else {
                 # Файл правили после модуля — убираем только свои ключи, остальное как есть.
-                $ser = Get-CrJsonSerializer
-                $obj = $ser.DeserializeObject($current)
+                $obj = (Get-CrJsonSerializer).DeserializeObject($current)
                 if ($obj.ContainsKey('env') -and $obj['env'] -is [System.Collections.Generic.IDictionary[string, object]]) {
                     foreach ($k in $script:TcStrictEnv.Keys) {
                         if ($rec['prev'].ContainsKey($k)) { $obj['env'][$k] = $rec['prev'][$k] } else { [void]$obj['env'].Remove($k) }
@@ -145,12 +162,12 @@ function Restore-TcEnv($ctx) {
                     if (-not $rec['hadEnv'] -and $obj['env'].Count -eq 0) { [void]$obj.Remove('env') }
                 }
                 $nl = if ($current.Contains("`r`n")) { "`r`n" } else { "`n" }
-                [System.IO.File]::WriteAllText($path, (ConvertTo-TcJsonText $obj $nl), (New-Object System.Text.UTF8Encoding $false))
+                Write-TcFileSafe $path (ConvertTo-TcJsonText $obj $nl)
             }
             [void]$orig.Remove($path)
             Write-TcLog $ctx 'ENV-RESTORED' $path ''
         }
-        catch { [void]$notes.Add("Не удалось вернуть $path — $($_.Exception.Message)"); Write-TcLog $ctx 'FAILED' $path $_.Exception.Message }
+        catch { [void]$notes.Add("Не удалось вернуть настройки ($($rec['where'])): $($_.Exception.Message). Исходник сохранён — повторите RESTORE позже."); Write-TcLog $ctx 'FAILED' $path $_.Exception.Message }
     }
     Save-TcOriginals $ctx $orig
     return @($notes)

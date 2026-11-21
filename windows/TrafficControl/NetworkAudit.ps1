@@ -64,6 +64,34 @@ function Test-TcClaudeProcess($p) {
     return ($p.Name -match '^(?i)(claude|cowork-svc)$') -or ($p.Name -ieq 'node' -and $cmd -match '@anthropic-ai[\\/]claude-code')
 }
 
+function Test-TcPublicAddress([string]$Ip) {
+    # Частные, служебные и подменные (fake-IP у VPN) адреса в правила не попадают никогда:
+    # такой адрес завтра может оказаться адресом api.anthropic.com.
+    $a = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip, [ref]$a)) { return $false }
+    $b = $a.GetAddressBytes()
+    if ($a.AddressFamily -eq 'InterNetwork') {
+        if ($b[0] -eq 10 -or $b[0] -eq 127 -or $b[0] -eq 0 -or $b[0] -ge 224) { return $false }
+        if ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) { return $false }
+        if ($b[0] -eq 192 -and $b[1] -eq 168) { return $false }
+        if ($b[0] -eq 169 -and $b[1] -eq 254) { return $false }
+        if ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) { return $false }   # CGNAT
+        if ($b[0] -eq 198 -and ($b[1] -eq 18 -or $b[1] -eq 19)) { return $false }  # 198.18.0.0/15 — fake-IP
+        return $true
+    }
+    if ($a.IsIPv6LinkLocal -or $a.IsIPv6SiteLocal -or $a.IsIPv4MappedToIPv6 -or [System.Net.IPAddress]::IsLoopback($a)) { return $false }
+    if (($b[0] -band 0xFE) -eq 0xFC) { return $false }   # fc00::/7
+    return $true
+}
+
+function Get-TcRowStatus([string]$State, [string]$Ip, $Blocked, [string]$Category) {
+    # Заблокированное соединение не устанавливается. Установленное соединение с адресом из правила —
+    # это обход блока (другая программа или путь), то есть утечка, а не BLOCKED.
+    if ($State -match '(?i)^syn' -and ($Blocked -contains $Ip)) { return 'BLOCKED' }
+    if ($Category -eq 'UNKNOWN') { return 'UNKNOWN' }
+    return 'ALLOWED'
+}
+
 function Get-TcConnections($ctx, $Map) {
     if (-not $Map) { $Map = Get-TcAddressMap $ctx }
     $blocked = Get-TcBlockedAddresses $ctx
@@ -78,17 +106,21 @@ function Get-TcConnections($ctx, $Map) {
         if (-not $mine.ContainsKey([int]$c.OwningProcess)) { continue }
         if ($c.RemoteAddress -match '^(0\.0\.0\.0|127\.|::1?$)') { continue }
         $cls = Resolve-TcCategory $Map $c.RemoteAddress
-        $status = if ($blocked.Windows -contains $c.RemoteAddress) { 'BLOCKED' } elseif ($cls.Category -eq 'UNKNOWN') { 'UNKNOWN' } else { 'ALLOWED' }
+        $status = Get-TcRowStatus ([string]$c.State) $c.RemoteAddress $blocked.Windows $cls.Category
         $p = $mine[[int]$c.OwningProcess]
-        [void]$rows.Add([pscustomobject]@{ Time = $now; Where = 'Windows'; Process = $p.Name; Pid = [int]$c.OwningProcess; RemoteAddress = $c.RemoteAddress; Host = $cls.Host; RemotePort = $c.RemotePort; Protocol = 'TCP'; Category = $cls.Category; Status = $status; Source = $cls.Source })
+        [void]$rows.Add([pscustomobject]@{ Time = $now; Where = 'Windows'; Process = $p.Name; Pid = [int]$c.OwningProcess; RemoteAddress = $c.RemoteAddress; Host = $cls.Host; RemotePort = $c.RemotePort; Protocol = 'TCP'; Category = $cls.Category; Status = $status; Source = $cls.Source; State = [string]$c.State })
     }
-    foreach ($d in @(& $ctx.Sys.WslDistros)) {
+    $running = @()
+    try { $running = @(& $ctx.Sys.WslRunning) } catch { Write-TcLog $ctx 'WARN' 'wsl' $_.Exception.Message }
+    foreach ($d in $running) {        # остановленные дистрибутивы не запускаются ради наблюдения
         $conns = @()
         try { $conns = @(& $ctx.Sys.WslConnections $d) } catch { Write-TcLog $ctx 'WARN' "WSL $d" $_.Exception.Message }
         foreach ($c in $conns) {
+            if ($c.RemoteAddress -match '^(0\.0\.0\.0|127\.|::1?$)') { continue }
+            $state = if ($c.PSObject.Properties['State']) { [string]$c.State } else { 'ESTAB' }
             $cls = Resolve-TcCategory $Map $c.RemoteAddress
-            $status = if ($blocked.Wsl -contains $c.RemoteAddress) { 'BLOCKED' } elseif ($cls.Category -eq 'UNKNOWN') { 'UNKNOWN' } else { 'ALLOWED' }
-            [void]$rows.Add([pscustomobject]@{ Time = $now; Where = "WSL $d"; Process = $c.Process; Pid = [int]$c.Pid; RemoteAddress = $c.RemoteAddress; Host = $cls.Host; RemotePort = $c.RemotePort; Protocol = 'TCP'; Category = $cls.Category; Status = $status; Source = $cls.Source })
+            $status = Get-TcRowStatus $state $c.RemoteAddress $blocked.Wsl $cls.Category
+            [void]$rows.Add([pscustomobject]@{ Time = $now; Where = "WSL $d"; Process = $c.Process; Pid = [int]$c.Pid; RemoteAddress = $c.RemoteAddress; Host = $cls.Host; RemotePort = $c.RemotePort; Protocol = 'TCP'; Category = $cls.Category; Status = $status; Source = $cls.Source; State = $state })
         }
     }
     return @($rows)

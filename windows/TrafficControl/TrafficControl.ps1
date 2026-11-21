@@ -27,32 +27,70 @@ $script:TcOptionalHosts = @('http-intake.logs.us5.datadoghq.com', 'browser-intak
 function New-TcRealSys {
     return @{
         GetTcpConnections   = { Get-NetTCPConnection -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ RemoteAddress = $_.RemoteAddress; RemotePort = $_.RemotePort; OwningProcess = $_.OwningProcess; State = [string]$_.State } } }
-        ResolveHost         = { param($h) try { @([System.Net.Dns]::GetHostAddresses($h) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString }) } catch { @() } }
+        ResolveHost         = { param($h) try { @([System.Net.Dns]::GetHostAddresses($h) | Where-Object { $_.AddressFamily -eq 'InterNetwork' -or $_.AddressFamily -eq 'InterNetworkV6' } | ForEach-Object { $_.IPAddressToString }) } catch { @() } }
         FwGetRules          = {
             Get-NetFirewallRule -Group $script:TcGroup -ErrorAction SilentlyContinue | ForEach-Object {
                 $app = $_ | Get-NetFirewallApplicationFilter; $adr = $_ | Get-NetFirewallAddressFilter
                 [pscustomobject]@{ Name = $_.Name; DisplayName = $_.DisplayName; Group = $_.Group; Program = $app.Program; RemoteAddress = @($adr.RemoteAddress); Action = [string]$_.Action; Direction = [string]$_.Direction }
             }
         }
-        FwNewRule           = { param($r) New-NetFirewallRule -Name $r.Name -DisplayName $r.DisplayName -Description $r.Description -Group $r.Group -Direction Outbound -Action Block -Program $r.Program -RemoteAddress $r.RemoteAddress -Protocol TCP -Profile Any -ErrorAction Stop | Out-Null }
+        FwNewRule           = {
+            param($r)
+            $a = @{ Name = $r.Name; DisplayName = $r.DisplayName; Description = $r.Description; Group = $r.Group; Direction = 'Outbound'; Action = 'Block'; Program = $r.Program; RemoteAddress = $r.RemoteAddress; Profile = 'Any'; ErrorAction = 'Stop' }
+            if ($r.Protocol -and $r.Protocol -ne 'Any') { $a['Protocol'] = $r.Protocol }
+            New-NetFirewallRule @a | Out-Null
+        }
         FwRemoveRule        = { param($n) Remove-NetFirewallRule -Name $n -ErrorAction Stop }
-        HvGetRules          = { Get-NetFirewallHyperVRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'ClaudeTrafficControl-*' } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; DisplayName = $_.DisplayName; RemoteAddresses = @($_.RemoteAddresses); Action = [string]$_.Action } } }
-        HvNewRule           = { param($r) New-NetFirewallHyperVRule -Name $r.Name -DisplayName $r.DisplayName -Direction Outbound -Action Block -VMCreatorId $r.VMCreatorId -Protocol TCP -RemoteAddresses $r.RemoteAddresses -ErrorAction Stop | Out-Null }
+        HvGetRules          = {
+            if (-not (Get-Command Get-NetFirewallHyperVRule -ErrorAction SilentlyContinue)) { return @() }   # нет на старых сборках Windows
+            Get-NetFirewallHyperVRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'ClaudeTrafficControl-*' } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; DisplayName = $_.DisplayName; RemoteAddresses = @($_.RemoteAddresses); Action = [string]$_.Action } }
+        }
+        HvNewRule           = {
+            param($r)
+            if (-not (Get-Command New-NetFirewallHyperVRule -ErrorAction SilentlyContinue)) { throw 'в этой Windows нет брандмауэра Hyper-V для WSL (нужна Windows 11 22H2 или новее)' }
+            New-NetFirewallHyperVRule -Name $r.Name -DisplayName $r.DisplayName -Direction Outbound -Action Block -VMCreatorId $r.VMCreatorId -Protocol TCP -RemoteAddresses $r.RemoteAddresses -ErrorAction Stop | Out-Null
+        }
         HvRemoveRule        = { param($n) Remove-NetFirewallHyperVRule -Name $n -ErrorAction Stop }
+        StartService        = { param($n) Start-Service -Name $n -ErrorAction Stop }
+        RunTimed            = {
+            param($exe, $argList, $sec)
+            $out = [IO.Path]::GetTempFileName(); $err = [IO.Path]::GetTempFileName()
+            try {
+                $q = @($argList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } })
+                $pr = Start-Process -FilePath $exe -ArgumentList $q -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+                if (-not $pr.WaitForExit($sec * 1000)) { try { $pr.Kill() } catch { }; return @{ ExitCode = -1; Output = "нет ответа за $sec с" } }
+                $pr.WaitForExit()
+                return @{ ExitCode = $pr.ExitCode; Output = ([IO.File]::ReadAllText($out, [Text.Encoding]::UTF8) + [IO.File]::ReadAllText($err, [Text.Encoding]::UTF8)) }
+            }
+            finally { Remove-Item -LiteralPath $out, $err -ErrorAction SilentlyContinue }
+        }
         GetServiceStartType = { param($n) $s = Get-Service -Name $n -ErrorAction SilentlyContinue; if ($s) { [string]$s.StartType } else { $null } }
         SetServiceStartType = { param($n, $t) Set-Service -Name $n -StartupType $t -ErrorAction Stop }
         WslDistros          = {
             if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return @() }
             $raw = (& wsl.exe -l -q 2>$null | Out-String) -replace "`0", ''
-            @($raw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notlike 'docker-desktop*' })
+            if ($LASTEXITCODE -ne 0) { return @() }           # WSL не установлен или дистрибутивов нет: текст — не имена
+            @($raw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^[A-Za-z0-9._-]+$' -and $_ -notlike 'docker-desktop*' })
+        }
+        WslRunning          = {
+            if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return @() }
+            $raw = (& wsl.exe -l --running -q 2>$null | Out-String) -replace "`0", ''
+            if ($LASTEXITCODE -ne 0) { return @() }
+            @($raw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^[A-Za-z0-9._-]+$' -and $_ -notlike 'docker-desktop*' })
+        }
+        WslClaudePath       = {
+            param($d)
+            # Путь к claude из интерактивной оболочки (там PATH от .bashrc); последняя строка вывода, а не баннер входа.
+            $o = & wsl.exe -d $d -- bash -lic 'command -v claude' 2>$null
+            @($o | ForEach-Object { "$_".Trim() } | Where-Object { $_ -like '/*' }) | Select-Object -Last 1
         }
         WslHome             = { param($d) $h = (& wsl.exe -d $d -e sh -c 'printf %s "$HOME"' 2>$null | Out-String).Trim(); if ($h) { "\\wsl.localhost\$d" + ($h -replace '/', '\') } else { $null } }
         WslConnections      = {
             param($d)
             $lines = & wsl.exe -d $d -e ss -tnpH 2>$null
             foreach ($l in @($lines)) {
-                if ($l -match '^\S+\s+\d+\s+\d+\s+\S+\s+\[?([0-9a-fA-F:.]+?)\]?:(\d+)\s+users:\(\("([^"]+)",pid=(\d+)') {
-                    if ($Matches[3] -eq 'claude') { [pscustomobject]@{ RemoteAddress = $Matches[1]; RemotePort = [int]$Matches[2]; Process = $Matches[3]; Pid = [int]$Matches[4] } }
+                if ($l -match '^(\S+)\s+\d+\s+\d+\s+\S+\s+\[?([0-9a-fA-F:.]+?)\]?:(\d+)\s+users:\(\("([^"]+)",pid=(\d+)') {
+                    if ($Matches[4] -eq 'claude') { [pscustomobject]@{ State = $Matches[1]; RemoteAddress = $Matches[2]; RemotePort = [int]$Matches[3]; Process = $Matches[4]; Pid = [int]$Matches[5] } }
                 }
             }
         }
@@ -128,41 +166,54 @@ function Get-TcTelemetryAddresses($ctx) {
     $essential = Get-TcEssentialAddresses $ctx $map
     $addr = New-Object System.Collections.ArrayList
     $dropped = New-Object System.Collections.ArrayList
+    $private = New-Object System.Collections.ArrayList
     foreach ($h in $script:TcOptionalHosts) {
         foreach ($ip in @(& $ctx.Sys.ResolveHost $h)) {
+            if (-not $ip) { continue }
             if ($essential -contains $ip) { if (-not ($dropped -contains $ip)) { [void]$dropped.Add($ip) } }
-            elseif ($ip -and -not ($addr -contains $ip)) { [void]$addr.Add($ip) }
+            elseif (-not (Test-TcPublicAddress $ip)) { if (-not ($private -contains $ip)) { [void]$private.Add($ip) } }
+            elseif (-not ($addr -contains $ip)) { [void]$addr.Add($ip) }
         }
     }
-    return @{ Addresses = @($addr | Sort-Object); Dropped = @($dropped) }
+    return @{ Addresses = @($addr | Sort-Object); Dropped = @($dropped); Private = @($private) }
 }
 
 function Set-TcFirewall($ctx) {
+    # Возвращает заметки и итог сетевой части (Network) для карточки.
     $notes = New-Object System.Collections.ArrayList
     $t = Get-TcTelemetryAddresses $ctx
     if ($t.Dropped.Count) { [void]$notes.Add("Адреса $($t.Dropped -join ', ') общие с рабочими хостами — не блокируются.") }
-    # Пересоздаём свои правила телеметрии: без дублей и с актуальными адресами и путями.
+    if ($t.Private.Count) { [void]$notes.Add("DNS отдаёт служебные адреса ($($t.Private -join ', ')) — похоже, VPN или прокси с подменой адресов. Такие адреса не блокируются.") }
     foreach ($r in @(& $ctx.Sys.FwGetRules | Where-Object { $_.Group -eq $script:TcGroup -and $_.Name -like 'ClaudeTrafficControl-Datadog-*' })) { & $ctx.Sys.FwRemoveRule $r.Name }
-    foreach ($r in @(& $ctx.Sys.HvGetRules | Where-Object { $_.Name -like 'ClaudeTrafficControl-WSL-*' })) { & $ctx.Sys.HvRemoveRule $r.Name }
-    if (-not $t.Addresses.Count) { [void]$notes.Add('Адреса Datadog не определились — сетевых правил нет, работают только настройки.'); return @($notes) }
+    try { foreach ($r in @(& $ctx.Sys.HvGetRules | Where-Object { $_.Name -like 'ClaudeTrafficControl-WSL-*' })) { & $ctx.Sys.HvRemoveRule $r.Name } } catch { [void]$notes.Add("WSL: $($_.Exception.Message)") }
+    if (-not $t.Addresses.Count) { [void]$notes.Add('Публичных адресов Datadog не определилось — сетевых правил нет, работают только настройки.'); return @{ Notes = @($notes); Network = 'адреса не определились' } }
     $date = (Get-Date).ToString('dd.MM.yyyy')
-    foreach ($prog in (Get-TcClaudeCodePrograms $ctx)) {
+    $progs = @(Get-TcClaudeCodePrograms $ctx)
+    if (-not $progs.Count -and @(& $ctx.Sys.FindClaudeCli).Count) { [void]$notes.Add('Claude Code в Windows запущен не как claude.exe (например, через node) — общий node.exe не блокируется, действуют только настройки.') }
+    foreach ($prog in $progs) {
         $id = (Get-TcTextHash $prog.ToLowerInvariant()).Substring(0, 8)
         & $ctx.Sys.FwNewRule ([pscustomobject]@{
-                Name = "ClaudeTrafficControl-Datadog-$id"; Group = $script:TcGroup; Action = 'Block'; Direction = 'Outbound'
+                Name = "ClaudeTrafficControl-Datadog-$id"; Group = $script:TcGroup; Action = 'Block'; Direction = 'Outbound'; Protocol = 'TCP'
                 DisplayName = "Claude Traffic Control — телеметрия Datadog ($prog)"
                 Description = "Блокирует только необязательные хосты телеметрии Datadog ($($script:TcOptionalHosts -join ', '); code.claude.com/docs/en/network-config) и только для этой программы. Адреса на $date. Снять: RESTORE DEFAULTS."
                 Program = $prog; RemoteAddress = $t.Addresses })
         Write-TcLog $ctx 'FW-RULE' $prog ($t.Addresses -join ', ')
     }
-    if (@(& $ctx.Sys.WslDistros).Count) {
-        & $ctx.Sys.HvNewRule ([pscustomobject]@{
-                Name = 'ClaudeTrafficControl-WSL-Datadog'; DisplayName = 'Claude Traffic Control — телеметрия Datadog из WSL'
-                VMCreatorId = $script:TcWslVmCreator; RemoteAddresses = $t.Addresses; Action = 'Block'; Direction = 'Outbound' })
-        Write-TcLog $ctx 'HV-RULE' 'WSL' ($t.Addresses -join ', ')
-        [void]$notes.Add('Правило для WSL действует на всю ВМ WSL: другие программы в WSL тоже не достучатся до этих адресов Datadog.')
+    $wslTargets = @(Get-TcSettingsTargets $ctx | Where-Object { $_.Where -like 'WSL *' })
+    $hv = $false
+    if ($wslTargets.Count) {
+        try {
+            & $ctx.Sys.HvNewRule ([pscustomobject]@{
+                    Name = 'ClaudeTrafficControl-WSL-Datadog'; DisplayName = 'Claude Traffic Control — телеметрия Datadog из WSL'
+                    VMCreatorId = $script:TcWslVmCreator; RemoteAddresses = $t.Addresses; Action = 'Block'; Direction = 'Outbound' })
+            Write-TcLog $ctx 'HV-RULE' 'WSL' ($t.Addresses -join ', ')
+            $hv = $true
+            [void]$notes.Add('Правило для WSL действует на всю ВМ WSL: другие программы в WSL тоже не достучатся до этих адресов Datadog.')
+        }
+        catch { [void]$notes.Add("WSL: правило не создано — $($_.Exception.Message)"); Write-TcLog $ctx 'FAILED' 'HV-RULE' $_.Exception.Message }
     }
-    return @($notes)
+    $net = if ($progs.Count -or $hv) { 'blocked' } else { 'нет программ для правила' }
+    return @{ Notes = @($notes); Network = $net }
 }
 
 function Set-TcDesktopBlock($ctx, [bool]$On) {
@@ -173,7 +224,7 @@ function Set-TcDesktopBlock($ctx, [bool]$On) {
         foreach ($rel in @('app\Claude.exe', 'app\resources\cowork-svc.exe')) {
             $prog = Join-Path $base $rel
             & $ctx.Sys.FwNewRule ([pscustomobject]@{
-                    Name = 'ClaudeTrafficControl-Desktop-' + (Split-Path -Leaf $prog); Group = $script:TcGroup; Action = 'Block'; Direction = 'Outbound'
+                    Name = 'ClaudeTrafficControl-Desktop-' + (Split-Path -Leaf $prog); Group = $script:TcGroup; Action = 'Block'; Direction = 'Outbound'; Protocol = 'Any'
                     DisplayName = "Claude Traffic Control — Claude Desktop без сети ($(Split-Path -Leaf $prog))"
                     Description = "Полный блок исходящих соединений Claude Desktop версии $($ctx.Package.Version). После обновления Desktop путь меняется — примените снова. Снять: RESTORE DEFAULTS."
                     Program = $prog; RemoteAddress = @('Any') })
@@ -194,19 +245,27 @@ function Set-TcMode($ctx, [ValidateSet('SAFE', 'STRICT')][string]$Mode) {
         try { Set-TcEnv $ctx $t $want; [void]$notes.Add("$($t.Where): настройки записаны") }
         catch { [void]$notes.Add("$($t.Where): не удалось записать настройки — $($_.Exception.Message)"); Write-TcLog $ctx 'FAILED' $t.Path $_.Exception.Message }
     }
+    $network = 'нет прав администратора'
     if (& $ctx.Sys.IsAdmin) {
-        try { foreach ($n in (Set-TcFirewall $ctx)) { [void]$notes.Add($n) } }
-        catch { [void]$notes.Add("Брандмауэр: $($_.Exception.Message)"); Write-TcLog $ctx 'FAILED' 'firewall' $_.Exception.Message }
+        try { $fw = Set-TcFirewall $ctx; foreach ($n in $fw.Notes) { [void]$notes.Add($n) }; $network = $fw.Network }
+        catch { [void]$notes.Add("Брандмауэр: $($_.Exception.Message)"); $network = 'ошибка'; Write-TcLog $ctx 'FAILED' 'firewall' $_.Exception.Message }
         $svc = & $ctx.Sys.GetServiceStartType 'CoworkVMService'
         if ($svc -and $svc -ne 'Manual' -and $svc -ne 'Disabled') {
+            $obj = & $ctx.Sys.GetService 'CoworkVMService'
+            $wasRunning = [bool]($obj -and [string]$obj.Status -eq 'Running')
             $orig = Get-TcOriginals $ctx
-            if (-not $orig.ContainsKey('service:CoworkVMService')) { $orig['service:CoworkVMService'] = @{ startType = $svc }; Save-TcOriginals $ctx $orig }
-            try { & $ctx.Sys.SetServiceStartType 'CoworkVMService' 'Manual'; [void]$notes.Add('Служба Cowork: запуск «вручную» — без Desktop она не работает в фоне') ; Write-TcLog $ctx 'SERVICE' 'CoworkVMService' "$svc -> Manual" }
+            if (-not $orig.ContainsKey('service:CoworkVMService')) { $orig['service:CoworkVMService'] = @{ startType = $svc; wasRunning = $wasRunning }; Save-TcOriginals $ctx $orig }
+            try {
+                & $ctx.Sys.SetServiceStartType 'CoworkVMService' 'Manual'
+                Write-TcLog $ctx 'SERVICE' 'CoworkVMService' "$svc -> Manual"
+                if ($wasRunning -and -not (Get-CrClaudeProcesses $ctx).Desktop.Count) { & $ctx.Sys.StopService 'CoworkVMService'; [void]$notes.Add('Служба Cowork остановлена и запускается вручную: без Desktop она не работает в фоне') }
+                else { [void]$notes.Add('Служба Cowork запускается вручную; сейчас она нужна открытому Desktop и остановится после его закрытия и перезагрузки') }
+            }
             catch { [void]$notes.Add("Служба Cowork: $($_.Exception.Message)") }
         }
     }
     else { [void]$notes.Add('Без прав администратора: правила брандмауэра и служба Cowork не изменены. Запустите от имени администратора, чтобы применить сетевую часть.') }
-    Set-TcState $ctx @{ Mode = $Mode; LastChange = (Get-Date).ToString('dd.MM.yyyy HH:mm'); Status = 'не проверено' }
+    Set-TcState $ctx @{ Mode = $Mode; Network = $network; LastChange = (Get-Date).ToString('dd.MM.yyyy HH:mm'); Status = 'не проверено' }
     Write-TcLog $ctx 'MODE' $Mode ($notes -join ' | ')
     return @{ Notes = @($notes) }
 }
@@ -215,23 +274,41 @@ function Restore-TcDefaults($ctx) {
     $notes = New-Object System.Collections.ArrayList
     foreach ($n in (Restore-TcEnv $ctx)) { [void]$notes.Add($n) }
     $orig = Get-TcOriginals $ctx
+    $pending = $false
     if (& $ctx.Sys.IsAdmin) {
-        try {
-            foreach ($r in @(& $ctx.Sys.FwGetRules | Where-Object { $_.Group -eq $script:TcGroup })) { & $ctx.Sys.FwRemoveRule $r.Name; Write-TcLog $ctx 'FW-REMOVED' $r.Name '' }
-            foreach ($r in @(& $ctx.Sys.HvGetRules | Where-Object { $_.Name -like 'ClaudeTrafficControl-*' })) { & $ctx.Sys.HvRemoveRule $r.Name; Write-TcLog $ctx 'HV-REMOVED' $r.Name '' }
-        }
-        catch { [void]$notes.Add("Брандмауэр: $($_.Exception.Message)") }
+        try { foreach ($r in @(& $ctx.Sys.FwGetRules | Where-Object { $_.Group -eq $script:TcGroup })) { & $ctx.Sys.FwRemoveRule $r.Name; Write-TcLog $ctx 'FW-REMOVED' $r.Name '' } }
+        catch { $pending = $true; [void]$notes.Add("Брандмауэр: $($_.Exception.Message)") }
+        try { foreach ($r in @(& $ctx.Sys.HvGetRules | Where-Object { $_.Name -like 'ClaudeTrafficControl-*' })) { & $ctx.Sys.HvRemoveRule $r.Name; Write-TcLog $ctx 'HV-REMOVED' $r.Name '' } }
+        catch { $pending = $true; [void]$notes.Add("WSL: $($_.Exception.Message)") }
         if ($orig.ContainsKey('service:CoworkVMService')) {
-            try { & $ctx.Sys.SetServiceStartType 'CoworkVMService' $orig['service:CoworkVMService']['startType']; [void]$orig.Remove('service:CoworkVMService'); Save-TcOriginals $ctx $orig }
-            catch { [void]$notes.Add("Служба Cowork: $($_.Exception.Message)") }
+            $rec = $orig['service:CoworkVMService']
+            if (-not (& $ctx.Sys.GetServiceStartType 'CoworkVMService')) {
+                [void]$orig.Remove('service:CoworkVMService'); Save-TcOriginals $ctx $orig
+                [void]$notes.Add('Службы Cowork больше нет (Desktop удалён) — возвращать нечего.')
+            }
+            else {
+                try {
+                    & $ctx.Sys.SetServiceStartType 'CoworkVMService' $rec['startType']
+                    if ($rec.ContainsKey('wasRunning') -and $rec['wasRunning']) { & $ctx.Sys.StartService 'CoworkVMService' }
+                    [void]$orig.Remove('service:CoworkVMService'); Save-TcOriginals $ctx $orig
+                    Write-TcLog $ctx 'SERVICE' 'CoworkVMService' "-> $($rec['startType'])"
+                }
+                catch { $pending = $true; [void]$notes.Add("Служба Cowork: $($_.Exception.Message)") }
+            }
         }
     }
     else {
-        $left = @(& $ctx.Sys.FwGetRules | Where-Object { $_.Group -eq $script:TcGroup }).Count + @(& $ctx.Sys.HvGetRules).Count
-        if ($left -or $orig.ContainsKey('service:CoworkVMService')) { [void]$notes.Add('Правила брандмауэра и служба Cowork возвращаются только с правами администратора.') }
+        $left = 0
+        try { $left = @(& $ctx.Sys.FwGetRules | Where-Object { $_.Group -eq $script:TcGroup }).Count + @(& $ctx.Sys.HvGetRules).Count } catch { $left = 1 }
+        if ($left -or $orig.ContainsKey('service:CoworkVMService')) {
+            $pending = $true
+            [void]$notes.Add('Правила брандмауэра и служба Cowork возвращаются только с правами администратора. Запустите от имени администратора и нажмите RESTORE ещё раз.')
+        }
     }
-    Set-TcState $ctx @{ Mode = 'DEFAULT'; Status = 'NOT PROTECTED'; DesktopBlocked = $false; LastChange = (Get-Date).ToString('dd.MM.yyyy HH:mm') }
-    Write-TcLog $ctx 'RESTORE' '' ($notes -join ' | ')
+    if (@((Get-TcOriginals $ctx).Keys | Where-Object { $_ -notlike 'service:*' }).Count) { $pending = $true }
+    $mode = if ($pending) { 'RESTORE-PENDING' } else { 'DEFAULT' }
+    Set-TcState $ctx @{ Mode = $mode; Network = ''; Status = 'NOT PROTECTED'; DesktopBlocked = [bool]($pending -and (Get-TcState $ctx).DesktopBlocked); LastChange = (Get-Date).ToString('dd.MM.yyyy HH:mm') }
+    Write-TcLog $ctx 'RESTORE' $mode ($notes -join ' | ')
     return @{ Notes = @($notes) }
 }
 
@@ -241,7 +318,7 @@ function Restore-TcDefaults($ctx) {
 
 function Show-TcCard($ctx) {
     $s = Get-TcState $ctx
-    $modeName = @{ DEFAULT = 'как было (модуль ничего не менял)'; SAFE = 'SAFE CODE MODE'; STRICT = 'STRICT MODE' }[[string]$s.Mode]
+    $modeName = @{ DEFAULT = 'как было (модуль ничего не менял)'; SAFE = 'SAFE CODE MODE'; STRICT = 'STRICT MODE'; 'RESTORE-PENDING' = 'откат не завершён — нужны права администратора или доступ к WSL' }[[string]$s.Mode]
     $color = switch ([string]$s.Status) { 'PROTECTED' { 'Green' } 'PARTIALLY PROTECTED' { 'Yellow' } 'ERROR' { 'Red' } default { 'Gray' } }
     Write-Host ''
     Write-Host '==================== CLAUDE TRAFFIC CONTROL ====================' -ForegroundColor Cyan
@@ -249,10 +326,20 @@ function Show-TcCard($ctx) {
     Write-Host "  Статус:           $($s.Status)" -ForegroundColor $color
     Write-Host "  Claude Code:      $($s.ClaudeCode)"
     $svc = & $ctx.Sys.GetServiceStartType 'CoworkVMService'
-    $desk = if (-not $ctx.Package) { 'не установлен' } elseif ($s.DesktopBlocked) { 'сеть заблокирована' } elseif ($svc -eq 'Manual') { 'фон выключен (служба Cowork — вручную)' } else { 'работает как обычно' }
+    $svcObj = & $ctx.Sys.GetService 'CoworkVMService'
+    $svcRunning = [bool]($svcObj -and [string]$svcObj.Status -eq 'Running')
+    $deskRules = @(& $ctx.Sys.FwGetRules | Where-Object { $_.Group -eq $script:TcGroup -and $_.Name -like 'ClaudeTrafficControl-Desktop-*' })
+    $desk = if (-not $ctx.Package) { 'не установлен' }
+    elseif ($deskRules.Count -and @($deskRules | Where-Object { $_.Program -like "$($ctx.Package.InstallLocation)*" }).Count -eq $deskRules.Count) { 'сеть заблокирована (все протоколы)' }
+    elseif ($deskRules.Count) { 'блок устарел: Desktop обновился — включите блок снова (кнопка 7)' }
+    elseif ($svc -eq 'Manual' -and -not $svcRunning) { 'фон выключен (служба Cowork остановлена, запуск вручную)' }
+    elseif ($svc -eq 'Manual') { 'служба Cowork — вручную, сейчас работает (остановится после перезагрузки)' }
+    else { 'работает как обычно' }
     Write-Host "  Claude Desktop:   $desk"
+    $blockedNow = Get-TcBlockedAddresses $ctx
+    $dd = if (@($blockedNow.Windows).Count -or @($blockedNow.Wsl).Count) { 'метрики Datadog — блок сетью' } else { "метрики Datadog — НЕ заблокированы сетью ($(if ($s.ContainsKey('Network') -and $s.Network) { $s.Network } else { 'правил нет' }))" }
     $tel = switch ([string]$s.Mode) {
-        'SAFE' { 'отчёты об ошибках, /feedback, опросы — выкл.; метрики Datadog — блок сетью; метрики Anthropic — идут (общий канал с работой)' }
+        'SAFE' { "отчёты об ошибках, /feedback, опросы — выкл.; $dd; метрики Anthropic — идут (общий канал с работой)" }
         'STRICT' { 'метрики, отчёты об ошибках, /feedback, опросы — выкл. официально' }
         default { 'по умолчанию Claude Code' }
     }

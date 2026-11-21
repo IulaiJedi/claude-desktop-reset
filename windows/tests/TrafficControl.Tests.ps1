@@ -21,7 +21,8 @@ function New-TcFake {
             'console.anthropic.com' = @('160.79.104.10'); 'mcp-proxy.anthropic.com' = @('160.79.104.10'); 'downloads.claude.ai' = @('35.190.46.17')
             'http-intake.logs.us5.datadoghq.com' = @('34.149.66.165'); 'browser-intake-us5-datadoghq.com' = @('34.149.66.163'); 'api.mobbin.com' = @('64.239.109.193') }
         Tcp = @(); Processes = @(); ServiceStart = @{ 'CoworkVMService' = 'Automatic' }; Log = New-Object System.Collections.ArrayList
-        Wsl = @{ 'Ubuntu-24.04' = @{ Home = $wslHome; Conns = @(); Claude = $true } }
+        Wsl = @{ 'Ubuntu-24.04' = @{ Home = $wslHome; Conns = @(); Claude = '/home/me/.npm-global/bin/claude' } }
+        SvcRunning = @{ 'CoworkVMService' = $true }; Answer = 'Работает'
         ClaudeOk = $true; Package = [pscustomobject]@{ Name = 'Claude'; PackageFamilyName = 'Claude_pzs8sxrjxfjjc'; PackageFullName = 'Claude_2.9939.2.0_x64__pzs8sxrjxfjjc'; InstallLocation = 'C:\Program Files\WindowsApps\Claude_2.9939.2.0_x64__pzs8sxrjxfjjc'; Version = '2.9939.2.0' }
     }
     $sys = @{
@@ -39,7 +40,12 @@ function New-TcFake {
         HvRemoveRule = { param($n) foreach ($x in @($s.Hv)) { if ($x.Name -eq $n) { $s.Hv.Remove($x) } } }.GetNewClosure()
         GetServiceStartType = { param($n) $s.ServiceStart[$n] }.GetNewClosure()
         SetServiceStartType = { param($n, $t) $s.ServiceStart[$n] = $t; [void]$s.Log.Add("SvcStart $n $t") }.GetNewClosure()
-        GetService = { param($n) $null }.GetNewClosure()
+        GetService = { param($n) if ($s.SvcRunning.ContainsKey($n)) { [pscustomobject]@{ Name = $n; Status = $(if ($s.SvcRunning[$n]) { 'Running' } else { 'Stopped' }) } } }.GetNewClosure()
+        StopService = { param($n) $s.SvcRunning[$n] = $false; [void]$s.Log.Add("SvcStop $n") }.GetNewClosure()
+        StartService = { param($n) $s.SvcRunning[$n] = $true; [void]$s.Log.Add("SvcStart $n") }.GetNewClosure()
+        WslRunning = { @($s.Wsl.Keys) }.GetNewClosure()
+        WslClaudePath = { param($d) $s.Wsl[$d].Claude }.GetNewClosure()
+        RunTimed = { param($exe, $argList, $sec) [void]$s.Log.Add("Timed $exe $($argList -join ' ')"); if (-not $s.ClaudeOk) { @{ ExitCode = 1; Output = 'API Error' } } elseif ($argList -contains '-p') { @{ ExitCode = 0; Output = $s.Answer } } else { @{ ExitCode = 0; Output = 'ok' } } }.GetNewClosure()
         WslDistros = { @($s.Wsl.Keys) }.GetNewClosure()
         WslHome = { param($d) $s.Wsl[$d].Home }.GetNewClosure()
         WslConnections = { param($d) $s.Wsl[$d].Conns }.GetNewClosure()
@@ -234,5 +240,109 @@ Describe 'Traffic Control: card' {
         (Read-Json "$($t.U)\.claude\settings.json").env.DISABLE_ERROR_REPORTING | Should Be '1'
         $global:TcAnswers.Count | Should Be 0
         Test-Path -LiteralPath (Join-Path $t.Ctx.TcDir 'TrafficControl.log') | Should Be $true
+    }
+}
+
+Describe 'Traffic Control: review regressions' {
+    It 'T1: RESTORE returns the Cowork service start type and its running state' {
+        $t = New-TcFake
+        $null = Set-TcMode $t.Ctx 'SAFE'
+        $t.S.ServiceStart['CoworkVMService'] | Should Be 'Manual'
+        $t.S.SvcRunning['CoworkVMService'] | Should Be $false
+        $r = Restore-TcDefaults $t.Ctx
+        $t.S.ServiceStart['CoworkVMService'] | Should Be 'Automatic'
+        $t.S.SvcRunning['CoworkVMService'] | Should Be $true
+        @($r.Notes).Count | Should Be 0
+        (Get-Content -LiteralPath (Join-Path $t.Ctx.TcDir 'TrafficControl.log') -Raw) -match 'ENV-RESTORED \| service:' | Should Be $false
+    }
+
+    It 'T1: a settings file that cannot be reached during RESTORE keeps its original for later' {
+        $t = New-TcFake
+        $null = Set-TcMode $t.Ctx 'STRICT'
+        $t.Ctx.Sys.WslHome = { param($d) throw 'WSL is not running' }
+        $r = Restore-TcDefaults $t.Ctx
+        ($r.Notes -join ' ') -match 'WSL' | Should Be $true
+        @((Get-TcOriginals $t.Ctx).Keys | Where-Object { $_ -like '*wsl*' }).Count | Should Be 1
+    }
+
+    It 'T2: a live connection to a blocked telemetry address is a leak, not BLOCKED' {
+        $t = New-TcFake
+        $null = Set-TcMode $t.Ctx 'SAFE'
+        $t.S.Processes = @([pscustomobject]@{ Name = 'claude'; Id = 10; Path = 'C:\other\claude.exe'; CommandLine = 'claude' })
+        $t.S.Tcp = @([pscustomobject]@{ RemoteAddress = '34.149.66.165'; RemotePort = 443; OwningProcess = 10; State = 'Established' })
+        $row = @(Get-TcConnections $t.Ctx)[0]
+        $row.Status | Should Be 'ALLOWED'
+        $row.Category | Should Be 'TELEMETRY'
+    }
+
+    It 'T3: IPv6 addresses of the Datadog hosts are blocked too' {
+        $t = New-TcFake
+        $t.S.Dns['http-intake.logs.us5.datadoghq.com'] = @('34.149.66.165', '2600:1901:0:9e23::')
+        $null = Set-TcMode $t.Ctx 'SAFE'
+        @($t.S.Fw)[0].RemoteAddress -contains '2600:1901:0:9e23::' | Should Be $true
+    }
+
+    It 'T4: addresses from private or fake-IP ranges are never put into a rule' {
+        $t = New-TcFake
+        $t.S.Dns['http-intake.logs.us5.datadoghq.com'] = @('198.18.0.7')
+        $t.S.Dns['browser-intake-us5-datadoghq.com'] = @('10.1.2.3')
+        $r = Set-TcMode $t.Ctx 'SAFE'
+        @($t.S.Fw).Count | Should Be 0
+        @($t.S.Hv).Count | Should Be 0
+        ($r.Notes -join ' ') -match 'служебн' | Should Be $true
+    }
+
+    It 'T5: the card says Datadog is NOT blocked when no rule exists' {
+        Mock Write-Host { }
+        $t = New-TcFake
+        $t.S.Admin = $false
+        $null = Set-TcMode $t.Ctx 'SAFE'
+        Show-TcCard $t.Ctx
+        Assert-MockCalled Write-Host -Scope It -ParameterFilter { "$Object" -match 'Datadog — НЕ заблокированы' }
+    }
+
+    It 'T6: the full Desktop block covers every protocol' {
+        $t = New-TcFake
+        Set-TcDesktopBlock $t.Ctx $true
+        @($t.S.Fw | Where-Object { $_.Name -like 'ClaudeTrafficControl-Desktop-*' }).Count | Should Be 2
+        @($t.S.Fw | Where-Object { $_.Name -like 'ClaudeTrafficControl-Desktop-*' -and $_.Protocol -ne 'Any' }).Count | Should Be 0
+    }
+
+    It 'T7: RESTORE without administrator rights does not pretend everything is back' {
+        $t = New-TcFake
+        $null = Set-TcMode $t.Ctx 'SAFE'
+        $t.S.Admin = $false
+        $null = Restore-TcDefaults $t.Ctx
+        (Get-TcState $t.Ctx).Mode | Should Be 'RESTORE-PENDING'
+        (Get-TcOriginals $t.Ctx).ContainsKey('service:CoworkVMService') | Should Be $true
+    }
+
+    It 'T8: a WSL answer must actually be the answer, and runs are time-limited' {
+        $t = New-TcFake
+        $null = Set-TcMode $t.Ctx 'STRICT'
+        $t.S.Answer = ''
+        (Invoke-TcVerify $t.Ctx -TestPrompt).Status | Should Be 'ERROR'
+        ($t.S.Log -join "`n") -match 'Timed wsl\.exe -d Ubuntu-24.04 -e /home/me/\.npm-global/bin/claude -p' | Should Be $true
+    }
+
+    It 'T10: no WSL firewall rule when Claude Code is not set up in WSL' {
+        $t = New-TcFake
+        Remove-Item -LiteralPath "$($t.WslHome)\.claude" -Recurse -Force
+        $null = Set-TcMode $t.Ctx 'SAFE'
+        @($t.S.Hv).Count | Should Be 0
+    }
+
+    It 'T12: with no settings file anywhere the status is NOT PROTECTED' {
+        $t = New-TcFake
+        Remove-Item -LiteralPath "$($t.WslHome)\.claude", "$($t.U)\.claude" -Recurse -Force
+        $t.S.Admin = $false
+        $null = Set-TcMode $t.Ctx 'STRICT'
+        (Invoke-TcVerify $t.Ctx -TestPrompt).Status | Should Be 'NOT PROTECTED'
+    }
+
+    It 'T14: WSL loopback connections are not counted as unknown' {
+        $t = New-TcFake
+        $t.S.Wsl['Ubuntu-24.04'].Conns = @([pscustomobject]@{ RemoteAddress = '127.0.0.1'; RemotePort = 8080; Pid = 5; Process = 'claude' })
+        @(Get-TcConnections $t.Ctx).Count | Should Be 0
     }
 }
