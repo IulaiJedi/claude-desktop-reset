@@ -1818,6 +1818,7 @@ function Start-CrMenu($ctx) {
         Write-Host '  7. Проверка остатков'
         Write-Host '  8. Диагностика Claude Code — ничего не меняет'
         Write-Host '  9. Открыть папку с журналом и отчётами'
+        Write-Host ' 10. Claude Traffic Control — меньше телеметрии, Claude Code работает'
         Write-Host '  0. Выход'
         $c = ([string](Read-Host 'Выберите')).Trim()
         try {
@@ -1831,6 +1832,7 @@ function Start-CrMenu($ctx) {
                 '7' { $script:CrLines.Clear(); Show-CrResidue $ctx -NoTraces }
                 '8' { $script:CrLines.Clear(); Show-CrCodeDiagnostics $ctx; $f = Save-CrReport $ctx 'diagnostics' $null; Write-Host "Отчёт: $f" -ForegroundColor Green; [void](Read-Host 'Enter — в меню') }
                 '9' { [void][System.IO.Directory]::CreateDirectory($ctx.DataDir); & $ctx.Sys.OpenUrl $ctx.DataDir }
+                '10' { . (Join-Path $PSScriptRoot 'TrafficControl\TrafficControl.ps1'); Start-TcCard (New-TcContext) }
                 '0' { return }
                 default { Write-Host 'Нет такого пункта.' -ForegroundColor Yellow }
             }

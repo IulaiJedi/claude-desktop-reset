@@ -4,6 +4,6 @@
 $ErrorActionPreference = 'Stop'
 Import-Module Pester -RequiredVersion 3.4.0
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$r = Invoke-Pester -Script (Join-Path $here 'ClaudeReset.Tests.ps1') -PassThru -OutputFormat NUnitXml -OutputFile (Join-Path $env:TEMP 'ClaudeReset.Tests.xml')
+$r = Invoke-Pester -Script (Get-ChildItem -LiteralPath $here -Filter '*.Tests.ps1' | ForEach-Object { $_.FullName }) -PassThru -OutputFormat NUnitXml -OutputFile (Join-Path $env:TEMP 'ClaudeReset.Tests.xml')
 "PASSED=$($r.PassedCount) FAILED=$($r.FailedCount)"
 exit $r.FailedCount
