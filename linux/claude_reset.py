@@ -36,7 +36,8 @@ for _n in ["logs", "Crashpad", "sentry", "declarative_performance_observer.db", 
 for _n in ["config.json", "config.json.journal", "Local State", "Network", "Cookies", "Cookies-journal", "Local Storage", "Session Storage",
            "IndexedDB", "WebStorage", "File System", "DIPS", "DIPS-wal", "DIPS-journal", "SharedStorage", "SharedStorage-wal", "InterestGroups",
            "InterestGroups-wal", "shared_proto_db", "Trust Tokens", "Trust Tokens-journal", "Service Worker", "ant-did", "ant-device-registry.json",
-           "Partitions", "databases", "QuotaManager", "QuotaManager-journal", "Login Data", "Login Data-journal", "Web Data", "Web Data-journal"]:
+           "Partitions", "databases", "QuotaManager", "QuotaManager-journal", "Login Data", "Login Data-journal", "Web Data", "Web Data-journal",
+           "plugin-mcp-auth", "connectors"]:
     GROUP_OF[_n] = "auth"
 for _n in ["claude_desktop_config.json", "window-state.json", "Preferences", "extensions-blocklist.json", "plan-usage-history.json",
            "buddy-tokens.json", "Claude Extensions", "Claude Extensions Settings", "Dictionaries"]:
@@ -46,6 +47,7 @@ for _n in ["claude-code-sessions", "local-agent-mode-sessions", "git-shadow", "g
     GROUP_OF[_n] = "sessions"
 for _n in ["vm_bundles", "claude-code", "claude-code-vm"]:
     GROUP_OF[_n] = "runtime"
+ELECTRON_MARKERS = ("Local State", "Preferences", "config.json", "claude_desktop_config.json")
 LEVEL2_KEEP = {"claude_desktop_config.json", "Claude Extensions", "Claude Extensions Settings"}
 
 GROUP_INFO = {
@@ -92,10 +94,25 @@ class RealSys:
         if interactive:   # пароль sudo и вопросы apt — прямо в терминал человеку
             return subprocess.call(argv), ""
         try:
-            p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
             return p.returncode, (p.stdout + p.stderr)
         except (OSError, subprocess.TimeoutExpired) as e:
             return -1, str(e)
+
+    def desktop_executables(self):
+        """Файлы пакета claude-desktop — по ним и только по ним узнаётся запущенный Desktop."""
+        if not shutil.which("dpkg-query"):
+            return set()
+        code, out = self.run(["dpkg-query", "-L", "claude-desktop"])
+        if code != 0:
+            return set()
+        return {l.strip() for l in out.splitlines() if l.strip() and os.path.isfile(l.strip()) and os.access(l.strip(), os.X_OK)}
+
+    def exe_of(self, pid):
+        try:
+            return os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return ""
 
     def is_wsl(self):
         try:
@@ -117,7 +134,9 @@ class Ctx:
     sandbox: Path = None
     data_dir: Path = None
     extra_allowed: set = field(default_factory=set)
+    env: dict = None
     run_id: str = field(default_factory=lambda: dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    backups_made: int = 0
 
     def __post_init__(self):
         self.home = Path(self.home)
@@ -128,16 +147,26 @@ class Ctx:
         if self.data_dir is None:
             self.data_dir = self.home / "claude-reset-data"
         self.data_dir = Path(self.data_dir)
+        if self.env is None:
+            self.env = dict(os.environ)
+
+    def _xdg(self, var, default):
+        # По стандарту XDG относительный путь игнорируется. Домашняя папка и её служебные места — тоже:
+        # иначе корнем данных Desktop стала бы, например, ~/Claude.
+        v = (self.env or {}).get(var, "")
+        if v and os.path.isabs(v):
+            full, h = norm(v), norm(self.home)
+            if full != h and full != "/" and not any(under(full, norm(self.home / x)) for x in (".claude", ".local", "projects")):
+                return Path(full)
+        return default
 
     @property
     def config_home(self):
-        env = os.environ.get("XDG_CONFIG_HOME")
-        return Path(env) if env and self.sandbox is None else self.home / ".config"
+        return self._xdg("XDG_CONFIG_HOME", self.home / ".config")
 
     @property
     def cache_home(self):
-        env = os.environ.get("XDG_CACHE_HOME")
-        return Path(env) if env and self.sandbox is None else self.home / ".cache"
+        return self._xdg("XDG_CACHE_HOME", self.home / ".cache")
 
 
 @dataclass
@@ -220,7 +249,7 @@ def protected_dir(path: str) -> bool:
 
 def remove_tree(path: str, errors: list, kept: list) -> bool:
     """Удаляет без захода в ссылки; папки с .git/CLAUDE.md оставляет. True — удалено целиком."""
-    if os.path.islink(path) or os.path.isfile(path):
+    if os.path.islink(path) or (os.path.lexists(path) and not os.path.isdir(path)):   # файлы, ссылки, FIFO, сокеты
         try:
             os.unlink(path)
             return True
@@ -260,8 +289,11 @@ def desktop_roots(ctx):
     out = []
     for kind, p in cands:
         s = norm(p)
-        if os.path.isdir(s) and not os.path.islink(s) and not link_on_path(s):
-            out.append((kind, s))
+        if not (os.path.isdir(s) and not os.path.islink(s) and not link_on_path(s)):
+            continue
+        if kind != "cache" and not any(os.path.lexists(os.path.join(s, m)) for m in ELECTRON_MARKERS):
+            continue        # папка с таким именем, но не данные Electron — не наша
+        out.append((kind, s))
     return out
 
 
@@ -290,7 +322,7 @@ def code_auth_paths(ctx):
 
 
 def allowed_roots(ctx):
-    return [norm(ctx.config_home / "Claude"), norm(ctx.config_home / "Claude-3p"), norm(ctx.cache_home / "Claude")]
+    return [root for _, root in desktop_roots(ctx)]
 
 
 def deletable(ctx, path, allow_code_auth=False):
@@ -311,8 +343,6 @@ def deletable(ctx, path, allow_code_auth=False):
             return False, f"стоп-лист: {deny}"
     if os.path.dirname(full) == h and os.path.basename(full) == ".claude.json":
         return False, "стоп-лист: .claude.json правится, а не удаляется"
-    if full in [norm(r) for r in allowed_roots(ctx)] + [norm(ctx.config_home)]:
-        pass
     if link_on_path(full):
         return False, f"путь проходит через ссылку {link_on_path(full)}"
     if os.path.isdir(full) and not os.path.islink(full) and protected_dir(full):
@@ -426,6 +456,8 @@ def write_json_keep_mode(path: Path, obj):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, mode)
         json.loads(Path(tmp).read_text(encoding="utf-8"))     # проверка: корректный JSON
         os.replace(tmp, path)
@@ -436,12 +468,14 @@ def write_json_keep_mode(path: Path, obj):
 
 def rc_token_lines(ctx):
     out = []
-    for name in (".bashrc", ".profile", ".bash_profile", ".zshrc", ".zprofile"):
+    for name in (".bashrc", ".profile", ".bash_profile", ".bash_aliases", ".zshrc", ".zprofile", ".zshenv", ".config/fish/config.fish"):
         p = ctx.home / name
-        if not p.is_file() or p.is_symlink():
+        if not p.is_file():
             continue
         for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            if any(re.search(rf"\b{v}\s*=", line) for v in TOKEN_VARS) and not line.lstrip().startswith("#"):
+            if line.lstrip().startswith("#"):
+                continue
+            if any(re.search(rf"\b{v}\s*=", line) or re.search(rf"\bset\s+(-\w+\s+)*{v}\b", line) for v in TOKEN_VARS):
                 out.append((p, n))
     return out
 
@@ -452,22 +486,32 @@ def code_auth_plan(ctx):
         if os.path.lexists(p):
             name = os.path.basename(p)
             purpose = {".credentials.json": "Токены входа Claude Code и MCP-серверов", "telemetry": "Неотправленная телеметрия",
-                       "anthropic": "Вход в Console (без API-ключа)"}.get(name, "Копия .claude.json с данными аккаунта (сделана Claude)"
+                       "anthropic": "Профили Anthropic (вход в Console и CLI ant) — все профили и их настройки"}.get(name, "Копия .claude.json с данными аккаунта (сделана Claude)"
                                                                             if name.startswith(".claude.json") else "Состояние входа Claude Code")
             items.append(mk("code-auth", p, "dir" if os.path.isdir(p) and not os.path.islink(p) else "file", "code-auth", purpose, "высокий",
                             "Claude Code попросит войти заново."))
     cj = ctx.home / ".claude.json"
-    if cj.is_file() and not cj.is_symlink():
+    if cj.is_symlink():
+        items.append(Item("code-auth", str(cj), "manual", "code-auth", f"~/.claude.json — ссылка на {os.path.realpath(cj)}. Инструмент по ссылкам не пишет: "
+                          "уберите из файла ключи oauthAccount, userID, machineID вручную.", "вручную"))
+    elif cj.is_file():
         try:
-            keys = strip_keys(json.loads(cj.read_text(encoding="utf-8")))
+            obj = json.loads(cj.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict):
+                raise ValueError("верхний уровень — не объект")
+            keys = strip_keys(obj)
             if keys:
                 items.append(Item("code-auth", str(cj), "jsonstrip", "code-auth", "Из .claude.json уйдут ключи: " + ", ".join(keys), "средний",
                                   "Проекты, MCP-серверы и настройки в файле остаются."))
-        except (ValueError, OSError) as e:
-            items.append(Item("code-auth", str(cj), "manual", "code-auth", f".claude.json не читается: {e}", "вручную"))
+        except (ValueError, OSError, TypeError, AttributeError) as e:
+            items.append(Item("code-auth", str(cj), "manual", "code-auth", f".claude.json не читается ({e}) — проверьте вручную.", "вручную"))
     for p, n in rc_token_lines(ctx):
         items.append(Item("code-auth", str(p), "manual", "code-auth",
-                          f"В ~/{p.name}, строка {n}, задан токен Claude. Уберите строку вручную — файл ваш, инструмент его не правит.", "вручную"))
+                          f"В {short(ctx, p)}, строка {n}, задан токен Claude. Уберите строку вручную — файл ваш, инструмент его не правит.", "вручную"))
+    for v in TOKEN_VARS:
+        if (ctx.env or {}).get(v):
+            items.append(Item("code-auth", v, "manual", "code-auth", f"В текущем окружении задана {v} — значит, она прописана в профиле оболочки "
+                              "или в /etc/environment. Найдите и уберите её.", "вручную"))
     st = ctx.home / ".claude" / "settings.json"
     if st.is_file():
         try:
@@ -490,7 +534,7 @@ def user_copies(ctx):
         if n.startswith(".claude.json"):
             copy = n != ".claude.json" and not re.match(r"^\.claude\.json\.(backup|corrupted|tmp)(\.|$)", n)
         else:
-            copy = n != ".claude" and re.search(r"(?i)claude.*(backup|(^|[-_.])bak([-_.]|$))", n) is not None
+            copy = re.match(r"(?i)^\.?claude[-_. ]?(config|settings|backup|backups|bak)(\b|[-_.])", n) is not None
         if copy:
             out.append(mk("user-copies", e.path, "dir" if e.is_dir(follow_symlinks=False) else "file", "user-copies",
                           "Ваша копия настроек Claude — похоже, с данными входа", "ваш файл", "Удаляется только по отдельному подтверждению."))
@@ -501,8 +545,13 @@ def user_copies(ctx):
 #  Браузеры
 # ============================================================================
 
-BROWSERS = [  # (имя, путь от ~, процессы, семейство, несколько профилей)
+BROWSERS = [  # (имя, путь от ~ (".config/…" — от XDG_CONFIG_HOME), процессы, семейство, несколько профилей)
     ("Google Chrome", ".config/google-chrome", ("chrome",), "chromium", True),
+    ("Google Chrome Beta", ".config/google-chrome-beta", ("chrome",), "chromium", True),
+    ("Google Chrome Unstable", ".config/google-chrome-unstable", ("chrome",), "chromium", True),
+    ("Chromium (flatpak)", ".var/app/org.chromium.Chromium/config/chromium", ("chromium", "chrome"), "chromium", True),
+    ("Brave (flatpak)", ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser", ("brave",), "chromium", True),
+    ("Brave (snap)", "snap/brave/current/.config/BraveSoftware/Brave-Browser", ("brave",), "chromium", True),
     ("Chromium", ".config/chromium", ("chromium", "chromium-browse"), "chromium", True),
     ("Chromium (snap)", "snap/chromium/common/chromium", ("chromium", "chrome"), "chromium", True),
     ("Microsoft Edge", ".config/microsoft-edge", ("msedge",), "chromium", True),
@@ -527,7 +576,7 @@ def claude_host(h: str) -> bool:
 def browser_profiles(ctx):
     out = []
     for name, rel, procs, fam, multi in BROWSERS:
-        base = ctx.home / rel
+        base = ctx.config_home / rel[len(".config/"):] if rel.startswith(".config/") else ctx.home / rel
         if not base.is_dir() or base.is_symlink():
             continue
         if fam == "firefox":
@@ -598,7 +647,7 @@ def find_in_files(folder, kind):
 
 def browser_plan(ctx):
     items = []
-    running = {name for _, name, _ in ctx.sys.processes()}
+    running = {p[1] for p in ctx.sys.processes()}
     for bname, fam, procs, prof in browser_profiles(ctx):
         label = f"{bname}, профиль «{os.path.basename(prof)}»"
         if running & set(procs):
@@ -606,13 +655,11 @@ def browser_plan(ctx):
             continue
         dbs = [(os.path.join(prof, "Network", "Cookies"), "chromium-cookies"), (os.path.join(prof, "Cookies"), "chromium-cookies")] if fam == "chromium" \
             else [(os.path.join(prof, "cookies.sqlite"), "firefox-cookies"), (os.path.join(prof, "webappsstore.sqlite"), "firefox-webapps")]
-        seen = False
-        for db, detail in dbs:
-            if not os.path.isfile(db) or (seen and detail == "chromium-cookies"):
+        for db, detail in dbs:          # и Network/Cookies, и старый Cookies в корне профиля
+            if not os.path.isfile(db):
                 continue
-            seen = seen or detail == "chromium-cookies"
             try:
-                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                con = sqlite3.connect(Path(db).as_uri() + "?mode=ro", uri=True)
                 n = con.execute(f"SELECT count(*) FROM {SQL_TABLE[detail]} WHERE {sql_predicate(detail)}").fetchone()[0]
                 con.close()
                 if n:
@@ -648,9 +695,12 @@ def act_sqlrows(ctx, it):
     if ctx.sandbox is not None and not under(db, str(ctx.sandbox)):
         raise SandboxError(db)
     leaf = {"chromium-cookies": "Cookies", "firefox-cookies": "cookies.sqlite", "firefox-webapps": "webappsstore.sqlite"}.get(it.detail)
-    if os.path.basename(db) != leaf or not any(under(db, p) for _, _, _, p in browser_profiles(ctx)):
+    prof = next(((n, procs, p) for n, _, procs, p in browser_profiles(ctx) if under(db, p)), None)
+    if os.path.basename(db) != leaf or not prof or os.path.islink(db) or link_on_path(db):
         log(ctx, "REFUSED", db, "не база браузера")
         return Result(db, "refused", 0, "не база браузера")
+    if {p[1] for p in ctx.sys.processes()} & set(prof[1]):
+        return Result(db, "manual", 0, f"{prof[0]} снова открыт — закройте его и повторите")
     try:
         con = sqlite3.connect(db)
         n = con.execute(f"DELETE FROM {SQL_TABLE[it.detail]} WHERE {sql_predicate(it.detail)}").rowcount
@@ -690,7 +740,11 @@ def act_logout(ctx, it):
 
 
 def act_uninstall(ctx, it):
-    code, _ = ctx.sys.run(["sudo", "apt", "remove", "claude-desktop"], interactive=True)
+    try:
+        code, _ = ctx.sys.run(["sudo", "apt", "remove", "claude-desktop"], interactive=True)
+    except (KeyboardInterrupt, OSError) as e:
+        log(ctx, "FAILED", "claude-desktop", f"прервано: {type(e).__name__}")
+        return Result("claude-desktop", "failed", 0, "удаление пакета прервано")
     log(ctx, "UNINSTALL", "claude-desktop", f"код {code}")
     return Result("claude-desktop", "deleted" if code == 0 else "failed", 0, "" if code == 0 else f"apt вернул {code}")
 
@@ -719,6 +773,11 @@ def no_traces_plan(ctx, uninstall=False, skip_browsers=False):
     if not skip_browsers:
         plan += browser_plan(ctx)
     return plan
+
+
+def blocking(items):
+    """Что мешает сказать «готово»: всё, кроме ручных шагов и файлов самого человека."""
+    return [i for i in items if i.kind != "manual" and i.area not in ("user-copies", "tool-copies")]
 
 
 def residue(ctx, no_traces=False):
@@ -777,7 +836,9 @@ def compare_snapshots(a, b, auth_wizard=False):
 
 
 def make_backup(ctx, mcp_only=False):
-    d = ctx.data_dir / "backup" / ctx.run_id
+    """(папка, ошибки). Каждая копия — своя папка: повтор в той же сессии ничего не перезаписывает."""
+    ctx.backups_made += 1
+    d = ctx.data_dir / "backup" / f"{ctx.run_id}-{ctx.backups_made}{'-mcp' if mcp_only else ''}"
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(d, 0o700)
     os.chmod(d.parent, 0o700)
@@ -801,8 +862,11 @@ def make_backup(ctx, mcp_only=False):
         for f in ("claude_desktop_config.json", "window-state.json", "Preferences", "git-worktrees.json"):
             src = Path(root) / f
             if src.is_file() and not src.is_symlink():
-                shutil.copy2(src, dst / f)
-                copied.append(dst / f)
+                try:
+                    shutil.copy2(src, dst / f)
+                    copied.append(dst / f)
+                except OSError as e:
+                    errors.append(f"{src} — {e}")
         conf = Path(root) / "config.json"
         if conf.is_file():
             try:
@@ -824,7 +888,7 @@ def make_backup(ctx, mcp_only=False):
     (d / "manifest.json").write_text(json.dumps({"created": dt.datetime.now().isoformat(timespec="seconds"), "tool": f"ClaudeReset {VERSION}",
                                                  "mcpOnly": mcp_only, "files": files, "errors": errors}, ensure_ascii=False, indent=2), encoding="utf-8")
     log(ctx, "BACKUP", str(d), f"файлов: {len(files)}, ошибок: {len(errors)}")
-    return d
+    return d, errors
 
 
 # ============================================================================
@@ -941,11 +1005,15 @@ def word(prompt):
 
 
 def claude_running(ctx):
+    """Desktop — процессы, чей исполняемый файл из пакета claude-desktop; Code — claude вне пакета или пакет npm."""
+    exes = ctx.sys.desktop_executables()
     desk, code = [], []
-    for pid, name, cmd in ctx.sys.processes():
+    for p in ctx.sys.processes():
+        pid, name, cmd = p[0], p[1], p[2]
         if pid == os.getpid():
             continue
-        if name in ("claude-desktop",) or "/claude-desktop/" in cmd or name == "Claude":
+        exe = ctx.sys.exe_of(pid)
+        if exe and exe in exes:
             desk.append(pid)
         elif name == "claude" or "@anthropic-ai/claude-code" in cmd:
             code.append(pid)
@@ -973,11 +1041,17 @@ def level_flow(ctx, level):
         input("Enter — в меню")
         return
     if level >= 2 and yes("Сделать резервную копию настроек и сессий (без данных входа)?"):
-        out(f"Копия: {make_backup(ctx)}")
+        bdir, errs = make_backup(ctx)
+        out(f"Копия: {bdir} (ошибок: {len(errs)})")
+        for e in errs[:5]:
+            out(f"  ошибка копии: {e}")
+        if errs and not yes("Копия сделана с ошибками. Всё равно продолжить?"):
+            out("Отменено. Ничего не удалено.")
+            return
     if not (word("Удалить всё перечисленное?") if level == 3 else yes("Удалить перечисленное?")):
         out("Отменено. Ничего не удалено.")
         return
-    if not wait_closed(ctx, desktop=True):
+    if not wait_closed(ctx, desktop=True):     # прямо перед удалением
         out("Отменено. Ничего не удалено.")
         return
     before = code_snapshot(ctx)
@@ -995,21 +1069,26 @@ def no_traces_flow(ctx):
     out("Шаг 1. Выход на сервере: claude.ai → Settings → Account → Log Out. ВНИМАНИЕ: выкинет из аккаунта ВСЕ ваши устройства.")
     if ctx.sys.is_wsl():
         out("Вы в WSL: вход шёл через браузер Windows — его следы убирает Windows-утилита, пункт 5.")
-    input("Выйдите на claude.ai (или пропустите для теста) и нажмите Enter")
+    input("Выйдите на claude.ai и нажмите Enter (или просто Enter, чтобы пропустить шаг)")
     out("Шаг 2. Закройте Claude Desktop, все окна Claude Code и браузеры. Запускайте этот инструмент из обычного терминала, не из Claude Code.")
     if not wait_closed(ctx, desktop=True, code=True):
         out("Отменено. Ничего не удалено.")
         return
     uninstall = ctx.sys.desktop_package_installed() and yes("Удалить и сам пакет claude-desktop? Рекомендую: да")
     if any((Path(r) / "claude_desktop_config.json").is_file() for _, r in desktop_roots(ctx)) and yes("Сохранить список MCP-серверов Desktop (без данных аккаунта)?"):
-        out(f"Сохранено: {make_backup(ctx, mcp_only=True)}")
+        bdir, errs = make_backup(ctx, mcp_only=True)
+        out(f"Сохранено: {bdir}" + (f" (ошибок: {len(errs)})" if errs else ""))
     plan = no_traces_plan(ctx, uninstall=uninstall)
     show_plan(ctx, out, plan, "Шаг 3. План чистки")
     if not word("Удалить всё перечисленное?"):
         out("Отменено. Ничего не удалено.")
         return
+    if not wait_closed(ctx, desktop=True, code=True):      # ещё раз прямо перед удалением
+        out("Отменено. Ничего не удалено.")
+        return
     before = code_snapshot(ctx)
     res = run_plan(ctx, plan, allow_code_auth=True)
+    res += run_plan(ctx, [i for i in code_auth_plan(ctx) if i.kind != "manual"], allow_code_auth=True)   # что появилось после logout
     show_results(out, res)
     for p in compare_snapshots(before, code_snapshot(ctx), auth_wizard=True):
         out(f"ВНИМАНИЕ: {p}")
@@ -1020,9 +1099,11 @@ def no_traces_flow(ctx):
     left = residue(ctx, no_traces=True)
     show_plan(ctx, out, left, "Шаг 4. Проверка остатков")
     bad = [x for x in res if x.status in ("failed", "refused", "partial")]
-    out("Готово. Claude можно поставить и войти как впервые." if not left and not bad else
-        f"Сделано не всё: осталось пунктов — {len(left)}, ошибок и отказов — {len(bad)}. Разберите список выше.")
-    out("Не проверяются: история браузера, сохранённые пароли и кэш страниц — их чистят средствами браузера.")
+    hard = blocking(left)
+    out("Готово с файлами: следов, которые убирает инструмент, не осталось. Пункты «вручную» и ваши копии — выше." if not hard and not bad else
+        f"Сделано не всё: осталось пунктов — {len(hard)}, ошибок и отказов — {len(bad)}. Разберите список выше.")
+    out("Проверьте сами: запись Claude в связке ключей (GNOME Keyring / KWallet), а также историю браузера, сохранённые пароли и кэш страниц — "
+        "инструмент их не трогает.")
     print(f"Отчёт: {out.save(ctx, 'no-traces')}")
     input("Enter — в меню")
 

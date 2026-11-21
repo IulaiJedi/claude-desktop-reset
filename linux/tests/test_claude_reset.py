@@ -26,6 +26,8 @@ class FakeSys:
         self.log = []
         self.wsl = False
         self.apt_desktop = False
+        self.desktop_exes = set()
+        self.interrupt_uninstall = False
         self.claude = None
         self.run_code = 0
 
@@ -37,7 +39,15 @@ class FakeSys:
 
     def run(self, argv, timeout=120, interactive=False):
         self.log.append(" ".join(argv))
+        if interactive and self.interrupt_uninstall:
+            raise KeyboardInterrupt
         return self.run_code, ""
+
+    def desktop_executables(self):
+        return set(self.desktop_exes)
+
+    def exe_of(self, pid):
+        return {p[0]: p[3] for p in self.procs if len(p) > 3}.get(pid, "")
 
     def is_wsl(self):
         return self.wsl
@@ -64,7 +74,7 @@ class Box(unittest.TestCase):
         self.home = self.root / "home" / "me"
         self.home.mkdir(parents=True)
         self.sys = FakeSys()
-        self.ctx = cr.Ctx(home=self.home, sys=self.sys, sandbox=self.root, data_dir=self.root / "out")
+        self.ctx = cr.Ctx(home=self.home, sys=self.sys, sandbox=self.root, data_dir=self.root / "out", env={})
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -328,7 +338,8 @@ class TestWholeRun(Box):
 
     def test_backup_has_manifest_and_no_sign_in(self):
         self.desktop()
-        b = cr.make_backup(self.ctx)
+        b, errors = cr.make_backup(self.ctx)
+        self.assertEqual(errors, [])
         files = [str(p.relative_to(b)) for p in b.rglob("*") if p.is_file()]
         self.assertIn("manifest.json", files)
         self.assertTrue(any(f.endswith("claude_desktop_config.json") for f in files))
@@ -361,3 +372,109 @@ class TestWholeRun(Box):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReviewFixes(Box):
+    def test_xdg_pointing_home_or_relative_is_ignored(self):
+        write(self.home / "Claude" / "my-novel.txt", "chapter 1")
+        write(self.home / "anthropic" / "notes.txt", "mine")
+        self.ctx.env = {"XDG_CONFIG_HOME": str(self.home), "XDG_CACHE_HOME": "relative/cache"}
+        self.assertFalse(cr.deletable(self.ctx, str(self.home / "Claude"))[0])
+        self.assertFalse(cr.deletable(self.ctx, str(self.home / "anthropic"), allow_code_auth=True)[0])
+        self.assertEqual(cr.desktop_roots(self.ctx), [])
+        self.assertEqual(self.ctx.cache_home, self.home / ".cache")
+
+    def test_xdg_config_elsewhere_is_honoured(self):
+        alt = self.root / "cfg"
+        write(alt / "Claude" / "Local State", "{}")
+        write(alt / "Claude" / "Cache" / "d", "c")
+        self.ctx.env = {"XDG_CONFIG_HOME": str(alt)}
+        self.assertEqual([k for k, _ in cr.desktop_roots(self.ctx)], ["desktop"])
+
+    def test_a_folder_named_claude_without_electron_files_is_not_desktop(self):
+        write(self.home / ".config" / "Claude" / "notes.txt", "mine")
+        self.assertEqual(cr.desktop_roots(self.ctx), [])
+
+    def test_backup_errors_are_returned_and_each_backup_gets_its_own_folder(self):
+        self.desktop()
+        b1, e1 = cr.make_backup(self.ctx)
+        b2, e2 = cr.make_backup(self.ctx)
+        b3, _ = cr.make_backup(self.ctx, mcp_only=True)
+        self.assertEqual(len({b1, b2, b3}), 3)
+        self.assertEqual((e1, e2), ([], []))
+        self.assertTrue(any(i.area == "tool-copies" for i in cr.residue(self.ctx, no_traces=True)))
+
+    def test_symlinked_or_odd_claude_json_becomes_a_manual_item(self):
+        real = self.root / "dotfiles" / "claude.json"
+        write(real, json.dumps({"oauthAccount": {"emailAddress": "e"}}))
+        os.symlink(real, self.home / ".claude.json")
+        plan = cr.code_auth_plan(self.ctx)
+        self.assertTrue(any(i.kind == "manual" and ".claude.json" in i.purpose for i in plan))
+        os.unlink(self.home / ".claude.json")
+        write(self.home / ".claude.json", "[1, 2]")
+        self.assertTrue(any(i.kind == "manual" and ".claude.json" in i.purpose for i in cr.code_auth_plan(self.ctx)))
+
+    def test_desktop_is_recognised_by_its_package_files_only(self):
+        self.sys.desktop_exes = {"/usr/lib/claude-desktop/claude-desktop"}
+        self.sys.procs = [(10, "claude-desktop", "/usr/lib/claude-desktop/claude-desktop --type=renderer", "/usr/lib/claude-desktop/claude-desktop"),
+                          (11, "claude", "claude --continue", "/home/me/.local/share/claude/versions/2.1/claude"),
+                          (12, "node", "node /home/me/projects/claude-desktop/node_modules/.bin/vite", "/usr/bin/node")]
+        desk, code = cr.claude_running(self.ctx)
+        self.assertEqual((desk, code), ([10], [11]))
+
+    def test_an_interrupted_sudo_does_not_crash_the_plan(self):
+        self.desktop()
+        self.sys.apt_desktop = True
+        self.sys.interrupt_uninstall = True
+        res = cr.run_plan(self.ctx, cr.desktop_plan(self.ctx, 3, uninstall=True))
+        self.assertIn("failed", [r.status for r in res])
+        self.assertFalse((self.home / ".config" / "Claude").exists())
+
+    def test_plugin_sign_ins_go_on_level2(self):
+        r = self.desktop()
+        write(r / "plugin-mcp-auth" / "srv" / ".credentials.json", "{}")
+        write(r / "connectors" / "x" / "plugin-mcp" / ".credentials.json", "{}")
+        cr.run_plan(self.ctx, cr.desktop_plan(self.ctx, 2))
+        self.assertFalse((r / "plugin-mcp-auth").exists())
+        self.assertFalse((r / "connectors").exists())
+
+    def test_more_token_places_and_the_live_environment(self):
+        write(self.home / ".zshenv", "export CLAUDE_CODE_OAUTH_TOKEN=abc\n")
+        write(self.home / ".config" / "fish" / "config.fish", "set -gx ANTHROPIC_API_KEY sk-ant-x\n")
+        self.ctx.env = {"ANTHROPIC_AUTH_TOKEN": "t"}
+        purposes = " ".join(i.purpose for i in cr.code_auth_plan(self.ctx) if i.kind == "manual")
+        self.assertIn(".zshenv", purposes)
+        self.assertIn("config.fish", purposes)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN", purposes)
+
+    def test_user_copies_do_not_block_done_and_are_narrower(self):
+        write(self.home / "my-claude-bot.bak", "x")
+        write(self.home / "claude-config-backup.tar.gz", "x")
+        names = [Path(i.path).name for i in cr.user_copies(self.ctx)]
+        self.assertIn("claude-config-backup.tar.gz", names)
+        self.assertNotIn("my-claude-bot.bak", names)
+        self.assertEqual(cr.blocking(cr.residue(self.ctx, no_traces=True)), [])
+
+    def test_claude_json_mode_is_preserved_not_reset_to_0600(self):
+        self.code()
+        os.chmod(self.home / ".claude.json", 0o644)
+        cr.run_plan(self.ctx, cr.code_auth_plan(self.ctx), allow_code_auth=True)
+        self.assertEqual(stat.S_IMODE((self.home / ".claude.json").stat().st_mode), 0o644)
+
+    def test_stop_list_wins_even_over_an_explicit_allowance(self):
+        self.code()
+        for p in (self.home / ".claude" / "projects", self.home / ".local" / "bin", self.home / "projects"):
+            self.ctx.extra_allowed.add(str(p))
+            self.assertFalse(cr.deletable(self.ctx, str(p))[0], p)
+
+    def test_a_fifo_inside_desktop_data_is_removed(self):
+        r = self.desktop()
+        os.mkfifo(r / "Cache" / "pipe")
+        self.assertEqual(cr.delete(self.ctx, str(r / "Cache")).status, "deleted")
+
+    def test_link_root_is_reported_for_a_human(self):
+        target = self.root / "elsewhere"
+        write(target / "Local State", "{}")
+        (self.home / ".config").mkdir(parents=True)
+        os.symlink(target, self.home / ".config" / "Claude")
+        self.assertTrue(any(i.kind == "manual" and i.group == "link" for i in cr.residue(self.ctx)))
