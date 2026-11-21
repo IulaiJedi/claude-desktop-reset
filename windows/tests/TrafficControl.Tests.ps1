@@ -322,7 +322,7 @@ Describe 'Traffic Control: review regressions' {
         $null = Set-TcMode $t.Ctx 'STRICT'
         $t.S.Answer = ''
         (Invoke-TcVerify $t.Ctx -TestPrompt).Status | Should Be 'ERROR'
-        ($t.S.Log -join "`n") -match 'Timed wsl\.exe -d Ubuntu-24.04 -e /home/me/\.npm-global/bin/claude -p' | Should Be $true
+        ($t.S.Log -join "`n") -match 'Timed wsl\.exe -d Ubuntu-24.04 -e bash -lic .* /home/me/\.npm-global/bin/claude -p' | Should Be $true
     }
 
     It 'T10: no WSL firewall rule when Claude Code is not set up in WSL' {
@@ -344,5 +344,59 @@ Describe 'Traffic Control: review regressions' {
         $t = New-TcFake
         $t.S.Wsl['Ubuntu-24.04'].Conns = @([pscustomobject]@{ RemoteAddress = '127.0.0.1'; RemotePort = 8080; Pid = 5; Process = 'claude' })
         @(Get-TcConnections $t.Ctx).Count | Should Be 0
+    }
+}
+
+Describe 'Traffic Control: second review pass' {
+    It 'R1: the real timed runner returns the exit code and the output (harmless cmd.exe only)' {
+        $real = New-TcRealSys
+        (& $real.RunTimed 'cmd.exe' @('/c', 'exit', '3') 20).ExitCode | Should Be 3
+        $ok = & $real.RunTimed 'cmd.exe' @('/c', 'echo', 'tc-ok') 20
+        $ok.ExitCode | Should Be 0
+        $ok.Output -match 'tc-ok' | Should Be $true
+    }
+
+    It 'R2/R4: a login banner before the marker is ignored and any non-empty answer counts' {
+        $t = New-TcFake
+        $null = Set-TcMode $t.Ctx 'STRICT'
+        $t.S.Answer = "Welcome to Ubuntu`n__TC_OUT__`nГотово"
+        (Invoke-TcVerify $t.Ctx -TestPrompt).Status | Should Be 'PROTECTED'
+        $t.S.Answer = "Welcome to Ubuntu`n__TC_OUT__`n"
+        (Invoke-TcVerify $t.Ctx -TestPrompt).Status | Should Be 'ERROR'
+    }
+
+    It 'R3: a settings file that cannot be written leaves no temp file and no stale original' {
+        $t = New-TcFake
+        $f = "$($t.U)\.claude\settings.json"
+        (Get-Item -LiteralPath $f).IsReadOnly = $true
+        $r = Set-TcMode $t.Ctx 'SAFE'
+        ($r.Notes -join ' ') -match 'Windows: не удалось' | Should Be $true
+        Test-Path -LiteralPath "$f.tc-tmp" | Should Be $false
+        (Get-TcOriginals $t.Ctx).ContainsKey($f) | Should Be $false
+        (Get-Item -LiteralPath $f).IsReadOnly = $false
+    }
+
+    It 'R6: the Desktop block state comes from the rules themselves' {
+        $t = New-TcFake
+        Get-TcDesktopBlockState $t.Ctx | Should Be 'none'
+        Set-TcDesktopBlock $t.Ctx $true
+        Get-TcDesktopBlockState $t.Ctx | Should Be 'current'
+        $t.S.Package = [pscustomobject]@{ Name = 'Claude'; PackageFamilyName = 'Claude_pzs8sxrjxfjjc'; PackageFullName = 'Claude_3.0.0.0_x64__pzs8sxrjxfjjc'; InstallLocation = 'C:\Program Files\WindowsApps\Claude_3.0.0.0_x64__pzs8sxrjxfjjc'; Version = '3.0.0.0' }
+        Update-CrPackage $t.Ctx
+        Get-TcDesktopBlockState $t.Ctx | Should Be 'stale'
+    }
+
+    It 'R7: a WSL distro that was removed for good does not keep RESTORE pending forever' {
+        $t = New-TcFake
+        $null = Set-TcMode $t.Ctx 'SAFE'
+        $t.S.Wsl.Clear()
+        $r = Restore-TcDefaults $t.Ctx
+        (Get-TcState $t.Ctx).Mode | Should Be 'DEFAULT'
+        ($r.Notes -join ' ') -match 'удал' | Should Be $true
+    }
+
+    It 'R7: numbers like MAX_THINKING_TOKENS do not count as secrets' {
+        '{"env":{"MAX_THINKING_TOKENS":"31999"}}' -match $script:TcSecretPattern | Should Be $false
+        '{"env":{"ANTHROPIC_API_KEY":"sk-ant-abcdefgh"}}' -match $script:TcSecretPattern | Should Be $true
     }
 }

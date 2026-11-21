@@ -14,9 +14,16 @@ function Get-TcClaudeEnvironments($ctx) {
         $d = $t.Where.Substring(4)
         $path = $null
         try { $path = & $ctx.Sys.WslClaudePath $d } catch { }
-        if ($path) { [void]$envs.Add(@{ Where = $t.Where; Exe = 'wsl.exe'; Pre = @('-d', $d, '-e', $path) }) }
+        # Через интерактивную оболочку: PATH, прокси и ключи из .bashrc те же, что у человека. Метка отделяет баннер входа.
+        if ($path) { [void]$envs.Add(@{ Where = $t.Where; Exe = 'wsl.exe'; Pre = @('-d', $d, '-e', 'bash', '-lic', 'printf "\n__TC_OUT__\n"; exec "$0" "$@"', $path) }) }
     }
     return @($envs)
+}
+
+function Get-TcAnswerText([string]$Output) {
+    $i = $Output.LastIndexOf('__TC_OUT__')
+    if ($i -ge 0) { $Output = $Output.Substring($i + '__TC_OUT__'.Length) }
+    return $Output.Trim()
 }
 
 function Invoke-TcVerify($ctx, [switch]$TestPrompt) {
@@ -59,8 +66,12 @@ function Invoke-TcVerify($ctx, [switch]$TestPrompt) {
         if ($TestPrompt) {
             $p = & $run @('-p', $script:TcTestPrompt)
             $tested = $true
-            if ($p.ExitCode -eq 0 -and ([string]$p.Output) -match '(?i)работ') { [void]$checks.Add("$($e.Where): тестовый запрос — ответ получен") }
-            else { [void]$failedWhere.Add($e.Where); [void]$checks.Add("$($e.Where): тестовый запрос — ответа нет (код $($p.ExitCode): $((([string]$p.Output).Trim() -split "`n" | Select-Object -Last 1)))") }
+            $answer = Get-TcAnswerText ([string]$p.Output)
+            if ($p.ExitCode -eq 0 -and $answer) { [void]$checks.Add("$($e.Where): тестовый запрос — ответ получен") }
+            else {
+                $why = if ($p.ContainsKey('Error') -and $p.Error) { ([string]$p.Error).Trim() -split "`n" | Select-Object -Last 1 } else { $answer }
+                [void]$failedWhere.Add($e.Where); [void]$checks.Add("$($e.Where): тестовый запрос — ответа нет (код $($p.ExitCode): $why)")
+            }
         }
     }
     $claude = if (-not $envs.Count) { 'не найден' } elseif ($failedWhere.Count) { "не отвечает: $($failedWhere -join ', ')" } elseif ($tested) { 'работает' } else { 'не проверено' }

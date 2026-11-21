@@ -11,7 +11,7 @@ $script:TcStrictEnv = [ordered]@{}
 foreach ($k in $script:TcSafeEnv.Keys) { $script:TcStrictEnv[$k] = $script:TcSafeEnv[$k] }
 $script:TcStrictEnv['DISABLE_TELEMETRY'] = '1'   # метрики; выключает и загрузку флагов функций
 # Если в settings.json похоже на секрет — полную копию файла не храним, откат будет точечным.
-$script:TcSecretPattern = '(?i)(token|secret|password|passwd|api[_-]?key|credential|bearer)'
+$script:TcSecretPattern = '(?i)"[^"]*(api[_-]?key|secret|password|passwd|auth[_-]?token|oauth[_-]?token|access[_-]?token|refresh[_-]?token|bearer|credential)[^"]*"\s*:\s*"[^"]{8,}"'
 
 function Get-TcSettingsTargets($ctx) {
     # Файлы настроек Claude Code: Windows и каждый дистрибутив WSL, где есть ~/.claude.
@@ -93,6 +93,7 @@ function Set-TcEnv($ctx, $Target, $Desired) {
     $obj = $ser.DeserializeObject($text)
     if (-not ($obj -is [System.Collections.Generic.IDictionary[string, object]])) { throw "${path}: верхний уровень — не объект JSON" }
     $orig = Get-TcOriginals $ctx
+    $origBefore = Get-TcOriginals $ctx
     if (-not $orig.ContainsKey($path)) {
         $prev = @{}
         $hadEnv = $obj.ContainsKey('env') -and ($obj['env'] -is [System.Collections.Generic.IDictionary[string, object]])
@@ -112,20 +113,29 @@ function Set-TcEnv($ctx, $Target, $Desired) {
     $rec['written'] = Get-TcTextHash $new
     $orig[$path] = $rec
     Save-TcOriginals $ctx $orig                     # сначала исходник, потом правка файла
-    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $path))
-    Write-TcFileSafe $path $new
+    try {
+        [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+        Write-TcFileSafe $path $new
+    }
+    catch { Save-TcOriginals $ctx $origBefore; throw }   # файл не записан — и запись об исходнике не нужна
     Write-TcLog $ctx 'ENV-SET' $path (($Desired.Keys | ForEach-Object { "$_=$($Desired[$_])" }) -join ', ')
 }
 
 function Write-TcFileSafe([string]$Path, [string]$Text) {
     # Через временный файл: оборванная запись не оставит полфайла настроек.
+    $enc = New-Object System.Text.UTF8Encoding $false
+    $info = Get-CrItemInfo $Path
+    if ($info -and (Test-CrReparsePoint $info)) { [System.IO.File]::WriteAllText($Path, $Text, $enc); return }   # ссылку не подменяем файлом — пишем в её цель
     $tmp = "$Path.tc-tmp"
-    [System.IO.File]::WriteAllText($tmp, $Text, (New-Object System.Text.UTF8Encoding $false))
-    if ([System.IO.File]::Exists($Path)) {
-        try { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
-        catch { [System.IO.File]::Copy($tmp, $Path, $true); [System.IO.File]::Delete($tmp) }   # на дисках WSL Replace может не работать
+    try {
+        [System.IO.File]::WriteAllText($tmp, $Text, $enc)
+        if ([System.IO.File]::Exists($Path)) {
+            try { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+            catch { [System.IO.File]::Copy($tmp, $Path, $true) }   # на дисках WSL Replace может не работать
+        }
+        else { [System.IO.File]::Move($tmp, $Path) }
     }
-    else { [System.IO.File]::Move($tmp, $Path) }
+    finally { if ([System.IO.File]::Exists($tmp)) { [System.IO.File]::Delete($tmp) } }
 }
 
 function Get-TcTextHash([string]$Text) {
@@ -140,7 +150,14 @@ function Restore-TcEnv($ctx) {
         $rec = $orig[$path]
         try {
             $where = [string]$rec['where']
-            if ($where -like 'WSL *') { $null = & $ctx.Sys.WslHome $where.Substring(4) }   # дистрибутив должен быть доступен
+            if ($where -like 'WSL *') {
+                $d = $where.Substring(4)
+                if (-not (@(& $ctx.Sys.WslDistros) -contains $d)) {
+                    [void]$orig.Remove($path); [void]$notes.Add("Дистрибутив WSL $d удалён — возвращать в нём нечего."); Write-TcLog $ctx 'ENV-DROPPED' $path 'дистрибутив удалён'
+                    continue
+                }
+                $null = & $ctx.Sys.WslHome $d      # дистрибутив должен быть доступен
+            }
             Assert-CrInSandbox $ctx $path
             $current = if ([System.IO.File]::Exists($path)) { [System.IO.File]::ReadAllText($path) } else { $null }
             $haveText = $null -ne $rec['text']

@@ -58,9 +58,10 @@ function New-TcRealSys {
             try {
                 $q = @($argList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } })
                 $pr = Start-Process -FilePath $exe -ArgumentList $q -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
-                if (-not $pr.WaitForExit($sec * 1000)) { try { $pr.Kill() } catch { }; return @{ ExitCode = -1; Output = "нет ответа за $sec с" } }
+                $null = $pr.Handle      # без удержанного дескриптора PS 5.1 теряет код выхода (ExitCode = $null)
+                if (-not $pr.WaitForExit($sec * 1000)) { try { $pr.Kill() } catch { }; return @{ ExitCode = -1; Output = ''; Error = "нет ответа за $sec с" } }
                 $pr.WaitForExit()
-                return @{ ExitCode = $pr.ExitCode; Output = ([IO.File]::ReadAllText($out, [Text.Encoding]::UTF8) + [IO.File]::ReadAllText($err, [Text.Encoding]::UTF8)) }
+                return @{ ExitCode = $pr.ExitCode; Output = [IO.File]::ReadAllText($out, [Text.Encoding]::UTF8); Error = [IO.File]::ReadAllText($err, [Text.Encoding]::UTF8) }
             }
             finally { Remove-Item -LiteralPath $out, $err -ErrorAction SilentlyContinue }
         }
@@ -81,7 +82,7 @@ function New-TcRealSys {
         WslClaudePath       = {
             param($d)
             # Путь к claude из интерактивной оболочки (там PATH от .bashrc); последняя строка вывода, а не баннер входа.
-            $o = & wsl.exe -d $d -- bash -lic 'command -v claude' 2>$null
+            $o = & wsl.exe -d $d -e bash -lic 'command -v claude' 2>$null      # -e: без второй оболочки, кавычки не перетолковываются
             @($o | ForEach-Object { "$_".Trim() } | Where-Object { $_ -like '/*' }) | Select-Object -Last 1
         }
         WslHome             = { param($d) $h = (& wsl.exe -d $d -e sh -c 'printf %s "$HOME"' 2>$null | Out-String).Trim(); if ($h) { "\\wsl.localhost\$d" + ($h -replace '/', '\') } else { $null } }
@@ -93,12 +94,6 @@ function New-TcRealSys {
                     if ($Matches[4] -eq 'claude') { [pscustomobject]@{ State = $Matches[1]; RemoteAddress = $Matches[2]; RemotePort = [int]$Matches[3]; Process = $Matches[4]; Pid = [int]$Matches[5] } }
                 }
             }
-        }
-        WslRun              = {
-            param($d, $argList)
-            $cmd = ($argList | ForEach-Object { "'" + ($_ -replace "'", "'\''") + "'" }) -join ' '
-            $out = & wsl.exe -d $d -- bash -lic $cmd 2>&1 | Out-String
-            @{ ExitCode = $LASTEXITCODE; Output = $out }
         }
     }
 }
@@ -216,6 +211,15 @@ function Set-TcFirewall($ctx) {
     return @{ Notes = @($notes); Network = $net }
 }
 
+function Get-TcDesktopBlockState($ctx) {
+    # none — правил нет; current — правила на путях текущей версии Desktop; stale — Desktop обновился, правила старые.
+    $rules = @()
+    try { $rules = @(& $ctx.Sys.FwGetRules | Where-Object { $_.Group -eq $script:TcGroup -and $_.Name -like 'ClaudeTrafficControl-Desktop-*' }) } catch { return 'unknown' }
+    if (-not $rules.Count) { return 'none' }
+    if ($ctx.Package -and @($rules | Where-Object { $_.Program -like "$($ctx.Package.InstallLocation)*" }).Count -eq $rules.Count) { return 'current' }
+    return 'stale'
+}
+
 function Set-TcDesktopBlock($ctx, [bool]$On) {
     # Полный сетевой блок Claude Desktop (по путям текущей версии). Отдельная кнопка, не часть режимов.
     foreach ($r in @(& $ctx.Sys.FwGetRules | Where-Object { $_.Group -eq $script:TcGroup -and $_.Name -like 'ClaudeTrafficControl-Desktop-*' })) { & $ctx.Sys.FwRemoveRule $r.Name }
@@ -328,19 +332,20 @@ function Show-TcCard($ctx) {
     $svc = & $ctx.Sys.GetServiceStartType 'CoworkVMService'
     $svcObj = & $ctx.Sys.GetService 'CoworkVMService'
     $svcRunning = [bool]($svcObj -and [string]$svcObj.Status -eq 'Running')
-    $deskRules = @(& $ctx.Sys.FwGetRules | Where-Object { $_.Group -eq $script:TcGroup -and $_.Name -like 'ClaudeTrafficControl-Desktop-*' })
+    $deskState = Get-TcDesktopBlockState $ctx
     $desk = if (-not $ctx.Package) { 'не установлен' }
-    elseif ($deskRules.Count -and @($deskRules | Where-Object { $_.Program -like "$($ctx.Package.InstallLocation)*" }).Count -eq $deskRules.Count) { 'сеть заблокирована (все протоколы)' }
-    elseif ($deskRules.Count) { 'блок устарел: Desktop обновился — включите блок снова (кнопка 7)' }
+    elseif ($deskState -eq 'current') { 'сеть заблокирована (все протоколы)' }
+    elseif ($deskState -eq 'stale') { 'блок устарел: Desktop обновился — обновите блок (кнопка 7)' }
     elseif ($svc -eq 'Manual' -and -not $svcRunning) { 'фон выключен (служба Cowork остановлена, запуск вручную)' }
     elseif ($svc -eq 'Manual') { 'служба Cowork — вручную, сейчас работает (остановится после перезагрузки)' }
     else { 'работает как обычно' }
     Write-Host "  Claude Desktop:   $desk"
-    $blockedNow = Get-TcBlockedAddresses $ctx
+    $blockedNow = Get-TcBlockedAddresses $ctx      # внутри — try: сбой чтения правил не роняет карточку
     $dd = if (@($blockedNow.Windows).Count -or @($blockedNow.Wsl).Count) { 'метрики Datadog — блок сетью' } else { "метрики Datadog — НЕ заблокированы сетью ($(if ($s.ContainsKey('Network') -and $s.Network) { $s.Network } else { 'правил нет' }))" }
     $tel = switch ([string]$s.Mode) {
         'SAFE' { "отчёты об ошибках, /feedback, опросы — выкл.; $dd; метрики Anthropic — идут (общий канал с работой)" }
         'STRICT' { 'метрики, отчёты об ошибках, /feedback, опросы — выкл. официально' }
+        'RESTORE-PENDING' { 'откат не завершён — часть настроек или правил ещё действует' }
         default { 'по умолчанию Claude Code' }
     }
     Write-Host "  Телеметрия:       $tel"
@@ -370,8 +375,8 @@ function Invoke-TcModeFlow($ctx, [string]$Mode) {
     if (& $ctx.Sys.IsAdmin) {
         $a = Get-TcTelemetryAddresses $ctx
         Write-Host "  Брандмауэр: блок адресов Datadog $($a.Addresses -join ', ') только для: $((Get-TcClaudeCodePrograms $ctx) -join '; ')"
-        if (@(& $ctx.Sys.WslDistros).Count) { Write-Host '  WSL: то же правило для всей ВМ WSL — другие программы в WSL тоже не достучатся до этих адресов Datadog.' -ForegroundColor Yellow }
-        Write-Host '  Служба Cowork (Claude Desktop): запуск «вручную»'
+        if (@(Get-TcSettingsTargets $ctx | Where-Object { $_.Where -like 'WSL *' }).Count) { Write-Host '  WSL: то же правило для всей ВМ WSL — другие программы в WSL тоже не достучатся до этих адресов Datadog.' -ForegroundColor Yellow }
+        Write-Host '  Служба Cowork (Claude Desktop): запуск «вручную»; если Desktop закрыт — остановится сейчас'
     }
     else { Write-Host '  Без прав администратора: только настройки; брандмауэр и служба — нет.' -ForegroundColor Yellow }
     if ($Mode -eq 'STRICT') {
@@ -417,8 +422,13 @@ function Start-TcCard($ctx) {
                 '6' { Show-TcVerify (Invoke-TcVerify $ctx -TestPrompt:(Read-CrYes 'Отправить тестовый запрос в Claude Code (немного лимита)?')); [void](Read-Host 'Enter — к карточке') }
                 '7' {
                     if (-not (& $ctx.Sys.IsAdmin)) { Write-Host 'Нужны права администратора.' -ForegroundColor Yellow; [void](Read-Host 'Enter — к карточке'); continue }
-                    $on = -not [bool](Get-TcState $ctx).DesktopBlocked
-                    $q = if ($on) { 'Заблокировать Claude Desktop сеть полностью? Desktop перестанет работать онлайн; Claude Code это не затронет' } else { 'Снять сетевой блок Claude Desktop?' }
+                    $st = Get-TcDesktopBlockState $ctx
+                    $on = $st -ne 'current'
+                    $q = switch ($st) {
+                        'current' { 'Снять сетевой блок Claude Desktop?' }
+                        'stale' { 'Desktop обновился, блок устарел. Обновить блок под текущую версию?' }
+                        default { 'Заблокировать Claude Desktop сеть полностью? Desktop перестанет работать онлайн; Claude Code это не затронет' }
+                    }
                     if (Read-CrYes $q) { Set-TcDesktopBlock $ctx $on }
                 }
                 '0' { return }
