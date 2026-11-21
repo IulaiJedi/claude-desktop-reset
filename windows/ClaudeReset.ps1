@@ -934,6 +934,157 @@ function Invoke-CrAction_manual($ctx, $item) {
 }
 
 # ============================================================================
+#  Резервная копия (без данных входа)
+# ============================================================================
+
+function Copy-CrDir([string]$Src, [string]$Dst) {
+    # robocopy держит пути длиннее 260 символов; /XJ — не заходить в ссылки.
+    $null = & robocopy.exe $Src $Dst /E /XJ /R:1 /W:1 /NP /NFL /NDL /NJH /NJS 2>&1
+    return ($LASTEXITCODE -lt 8)
+}
+
+function Protect-CrFolder([string]$Dir) {
+    # Доступ к копии — только у текущего пользователя.
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $null = & icacls.exe $Dir /inheritance:r /grant:r "${me}:(OI)(CI)F" 2>&1
+}
+
+function Remove-CrJsonKeys([string]$Text, [scriptblock]$Drop) {
+    $ser = Get-CrJsonSerializer
+    $obj = $ser.DeserializeObject($Text)
+    foreach ($k in @($obj.Keys)) { if (& $Drop $k) { [void]$obj.Remove($k) } }
+    return $ser.Serialize($obj)
+}
+
+function New-CrBackup($ctx, [switch]$McpOnly, [switch]$IncludeCoworkDisk) {
+    $dir = Join-Path $ctx.DataDir "backup\$($ctx.RunId)"
+    [void][System.IO.Directory]::CreateDirectory($dir)
+    Protect-CrFolder $dir
+    $errors = New-Object System.Collections.ArrayList
+    $copied = New-Object System.Collections.ArrayList    # пары источник -> копия
+    $roots = @(Get-CrDesktopRoots $ctx)
+
+    if ($McpOnly) {
+        foreach ($r in $roots) {
+            $cfg = Join-Path $r.Path 'claude_desktop_config.json'
+            if (-not [System.IO.File]::Exists($cfg)) { continue }
+            try {
+                $ser = Get-CrJsonSerializer
+                $obj = $ser.DeserializeObject([System.IO.File]::ReadAllText($cfg))
+                $keep = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+                $keep['mcpServers'] = if ($obj.ContainsKey('mcpServers')) { $obj['mcpServers'] } else { @{} }
+                $dst = Join-Path $dir "mcpServers-$($r.Kind).json"
+                [System.IO.File]::WriteAllText($dst, $ser.Serialize($keep), (New-Object System.Text.UTF8Encoding $false))
+                [void]$copied.Add(@($cfg, $dst))
+            }
+            catch { [void]$errors.Add("$cfg — $($_.Exception.Message)") }
+        }
+    }
+    else {
+        foreach ($r in $roots) {
+            $dst = Join-Path $dir "desktop-$($r.Kind)"
+            [void][System.IO.Directory]::CreateDirectory($dst)
+            foreach ($f in @('claude_desktop_config.json', 'window-state.json', 'Preferences', 'git-worktrees.json')) {
+                $src = Join-Path $r.Path $f
+                if ([System.IO.File]::Exists($src)) { [System.IO.File]::Copy($src, (Join-Path $dst $f), $true); [void]$copied.Add(@($src, (Join-Path $dst $f))) }
+            }
+            $cfg = Join-Path $r.Path 'config.json'
+            if ([System.IO.File]::Exists($cfg)) {
+                try {
+                    $clean = Remove-CrJsonKeys ([System.IO.File]::ReadAllText($cfg)) { param($k) $k -like 'oauth:*' -or $k -eq 'lastKnownAccountUuid' }
+                    [System.IO.File]::WriteAllText((Join-Path $dst 'config.json'), $clean, (New-Object System.Text.UTF8Encoding $false))
+                    [void]$copied.Add(@($cfg, (Join-Path $dst 'config.json')))
+                }
+                catch { [void]$errors.Add("$cfg — $($_.Exception.Message)") }
+            }
+            foreach ($d in @('claude-code-sessions', 'local-agent-mode-sessions', 'Claude Extensions', 'Claude Extensions Settings', 'logs')) {
+                $src = Join-Path $r.Path $d
+                if ([System.IO.Directory]::Exists($src)) {
+                    if (Copy-CrDir $src (Join-Path $dst $d)) { [void]$copied.Add(@($src, (Join-Path $dst $d))) } else { [void]$errors.Add("$src — robocopy не справился") }
+                }
+            }
+            $disk = Join-Path $r.Path 'vm_bundles\claudevm.bundle\sessiondata.vhdx'
+            if ($IncludeCoworkDisk -and [System.IO.File]::Exists($disk)) {
+                try { [System.IO.File]::Copy($disk, (Join-Path $dst 'sessiondata.vhdx'), $true); [void]$copied.Add(@($disk, (Join-Path $dst 'sessiondata.vhdx'))) }
+                catch { [void]$errors.Add("$disk — $($_.Exception.Message)") }
+            }
+        }
+        $outLogs = Join-Path $ctx.Paths.LocalAppData 'Claude\logs'
+        if ([System.IO.Directory]::Exists($outLogs)) {
+            if (Copy-CrDir $outLogs (Join-Path $dir 'outside-logs')) { [void]$copied.Add(@($outLogs, (Join-Path $dir 'outside-logs'))) }
+        }
+    }
+
+    # Манифест: каждый файл с размером и SHA-256.
+    $entries = New-Object System.Collections.ArrayList
+    foreach ($pair in $copied) {
+        $src = $pair[0]; $dst = $pair[1]
+        $files = if ([System.IO.Directory]::Exists($dst)) { @(Get-CrFilesUnder $dst) } else { @(New-Object System.IO.FileInfo $dst) }
+        foreach ($f in $files) {
+            $rel = $f.FullName.Substring($dir.Length + 1)
+            $from = if ([System.IO.Directory]::Exists($dst)) { Join-Path $src $f.FullName.Substring($dst.Length + 1) } else { $src }
+            [void]$entries.Add([ordered]@{ source = $from; backup = $rel; bytes = $f.Length; sha256 = (Get-CrHash $f.FullName) })
+        }
+    }
+    $manifest = [ordered]@{ created = (Get-Date).ToString('s'); computer = $env:COMPUTERNAME; tool = "ClaudeReset $($script:CrVersion)"; mcpOnly = [bool]$McpOnly; files = @($entries); errors = @($errors) }
+    [System.IO.File]::WriteAllText((Join-Path $dir 'manifest.json'), ($manifest | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding $false))
+    Write-CrLog $ctx 'BACKUP' $dir ("файлов: $($entries.Count), ошибок: $($errors.Count)")
+    return @{ Dir = $dir; Files = $entries.Count; Errors = @($errors) }
+}
+
+# ============================================================================
+#  Удаление приложения, остатки, мастер «без следов»
+# ============================================================================
+
+function Invoke-CrUninstallDesktop($ctx) {
+    if ($ctx.Package) {
+        $full = $ctx.Package.PackageFullName
+        try {
+            & $ctx.Sys.RemovePackage $full
+            Write-CrLog $ctx 'UNINSTALLED' $full 'MSIX'
+            $ctx.Package = & $ctx.Sys.GetDesktopPackage
+            return [pscustomobject]@{ Path = $full; Status = 'deleted'; Bytes = 0; Error = '' }
+        }
+        catch {
+            Write-CrLog $ctx 'FAILED' $full $_.Exception.Message
+            return [pscustomobject]@{ Path = $full; Status = 'failed'; Bytes = 0; Error = $_.Exception.Message }
+        }
+    }
+    $update = Join-Path $ctx.Paths.LocalAppData 'AnthropicClaude\Update.exe'
+    if ([System.IO.File]::Exists($update)) {
+        $r = & $ctx.Sys.RunProcess $update @('--uninstall', '-s')
+        Write-CrLog $ctx 'UNINSTALLED' $update ("старый установщик, код $($r.ExitCode)")
+        $st = if ($r.ExitCode -eq 0) { 'deleted' } else { 'failed' }
+        return [pscustomobject]@{ Path = $update; Status = $st; Bytes = 0; Error = $r.Output }
+    }
+    return [pscustomobject]@{ Path = ''; Status = 'absent'; Bytes = 0; Error = 'Desktop не установлен' }
+}
+
+function Get-CrNoTracesPlan($ctx) {
+    $plan = New-Object System.Collections.ArrayList
+    foreach ($i in (Get-CrDesktopPlan $ctx -Level 3)) { [void]$plan.Add($i) }
+    foreach ($i in (Get-CrCodeAuthPlan $ctx)) { [void]$plan.Add($i) }
+    foreach ($i in (Get-CrBrowserPlan $ctx)) { [void]$plan.Add($i) }
+    return @($plan)
+}
+
+function Get-CrResidue($ctx, [switch]$NoTraces) {
+    # То же, что аудит, но только то, чего после чистки быть не должно.
+    $out = New-Object System.Collections.ArrayList
+    foreach ($r in (Get-CrDesktopRoots $ctx)) {
+        [void]$out.Add((New-CrItem -Area 'desktop' -RootKind $r.Kind -Root $r.Path -Path $r.Path -Kind 'dir' -Group 'root' -Purpose "Данные Desktop ($($r.Kind))" -Risk 'остаток'))
+    }
+    foreach ($i in (Get-CrDesktopOutsideItems $ctx)) { if ($i.Kind -ne 'emptydir' -or @((New-Object System.IO.DirectoryInfo $i.Path).GetFileSystemInfos()).Count -eq 0) { [void]$out.Add($i) } }
+    foreach ($i in (Get-CrDesktopRegistryItems $ctx)) { [void]$out.Add($i) }
+    if ($NoTraces) {
+        foreach ($i in (Get-CrCodeAuthPlan $ctx)) { [void]$out.Add($i) }
+        foreach ($i in (Get-CrBrowserPlan $ctx)) { [void]$out.Add($i) }
+        foreach ($i in (Get-CrUserCopies $ctx)) { [void]$out.Add($i) }
+    }
+    return @($out)
+}
+
+# ============================================================================
 #  Снимок Claude Code — доказательство, что он не пострадал
 # ============================================================================
 

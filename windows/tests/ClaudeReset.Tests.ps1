@@ -520,3 +520,79 @@ Describe 'Browser traces of Claude' {
         (Test-CrDeletable $ctx "$p\IndexedDB\https_claude.ai_0.indexeddb.leveldb").Allowed | Should Be $true
     }
 }
+
+# ---------- 7. Backup ----------
+
+Describe 'Backup before reset' {
+    It 'copies settings and sessions with a hash manifest, never sign-in data' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        $ctx = New-TestContext $m $sys
+        $b = New-CrBackup $ctx
+
+        Test-Path -LiteralPath (Join-Path $b.Dir 'manifest.json') | Should Be $true
+        $files = @(Get-ChildItem -LiteralPath $b.Dir -Recurse -File | ForEach-Object { $_.FullName.Substring($b.Dir.Length + 1) })
+        ($files -match 'claude_desktop_config\.json$').Count | Should Be 1
+        ($files -match 'claude-code-sessions').Count | Should Be 1
+        ($files -match 'logs\\main\.log$').Count | Should Be 1
+        ($files -match 'Local State|Network|Local Storage|IndexedDB|ant-did|vm_bundles|Cache').Count | Should Be 0
+        $cfg = Get-ChildItem -LiteralPath $b.Dir -Recurse -Filter 'config.json' | Select-Object -First 1
+        $text = Get-Content -LiteralPath $cfg.FullName -Raw
+        $text -match 'oauth:|lastKnownAccountUuid' | Should Be $false
+        $text -match 'ru-RU' | Should Be $true
+        $man = Get-Content -LiteralPath (Join-Path $b.Dir 'manifest.json') -Raw | ConvertFrom-Json
+        $entry = @($man.files | Where-Object { $_.backup -like '*claude_desktop_config.json' })[0]
+        $entry.sha256 | Should Be (Get-FileHash -LiteralPath (Join-Path $b.Dir $entry.backup) -Algorithm SHA256).Hash
+    }
+
+    It 'in no-traces mode keeps only the MCP server list' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        $ctx = New-TestContext $m $sys
+        $b = New-CrBackup $ctx -McpOnly
+        $files = @(Get-ChildItem -LiteralPath $b.Dir -Recurse -File | Where-Object { $_.Name -ne 'manifest.json' })
+        $files.Count | Should Be 1
+        $j = Get-Content -LiteralPath $files[0].FullName -Raw | ConvertFrom-Json
+        @($j.PSObject.Properties.Name) -join ',' | Should Be 'mcpServers'
+    }
+}
+
+# ---------- 8. Uninstall, residue, the whole no-traces run ----------
+
+Describe 'Uninstall and residue check' {
+    It 'removes the package through Windows and then reports leftovers' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        New-FakeFile "$($m.Paths.LocalAppData)\Claude\logs\main.log" 'log'
+        $ctx = New-TestContext $m $sys
+
+        $u = Invoke-CrUninstallDesktop $ctx
+        $u.Status | Should Be 'deleted'
+        ($sys.State.Log -join "`n") -match 'RemovePackage Claude_2.9939.2.0_x64__pzs8sxrjxfjjc' | Should Be $true
+
+        $res = @(Get-CrResidue $ctx)
+        @($res | Where-Object { $_.Area -eq 'desktop' }).Count -gt 0 | Should Be $true
+        @($res | Where-Object { $_.Path -like '*Claude\logs' }).Count | Should Be 1
+    }
+
+    It 'finds nothing left after the no-traces run except what needs a human' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        New-FakeClaudeCode $m
+        New-FakeFile "$($m.Paths.LocalAppData)\Claude\logs\main.log" 'log'
+        $sys.State.Registry['HKCU:\Software\Classes\claude'] = @{ '(default)' = 'URL:claude' }
+        $p = Join-Path $m.Paths.LocalAppData 'Google\Chrome\User Data\Default'
+        New-FakeFile "$p\Preferences" '{}'
+        New-FakeFile "$p\IndexedDB\https_claude.ai_0.indexeddb.leveldb\000003.log" 'idb'
+        $ctx = New-TestContext $m $sys
+        $before = Get-CrCodeSnapshot $ctx
+
+        $plan = @(Get-CrNoTracesPlan $ctx)
+        $null = Invoke-CrPlan $ctx $plan -AllowCodeAuth
+        $after = Get-CrCodeSnapshot $ctx
+
+        @(Get-CrResidue $ctx -NoTraces | Where-Object { $_.Kind -ne 'manual' -and $_.Area -ne 'user-copies' }).Count | Should Be 0
+        @(Compare-CrCodeSnapshot $before $after -AuthWizard).Count | Should Be 0
+        Test-Path -LiteralPath "$($m.Paths.UserProfile)\.claude\projects\C--projects-a\s1.jsonl" | Should Be $true
+    }
+}
