@@ -391,9 +391,12 @@ class TestReviewFixes(Box):
         self.ctx.env = {"XDG_CONFIG_HOME": str(alt)}
         self.assertEqual([k for k, _ in cr.desktop_roots(self.ctx)], ["desktop"])
 
-    def test_a_folder_named_claude_without_electron_files_is_not_desktop(self):
-        write(self.home / ".config" / "Claude" / "notes.txt", "mine")
+    def test_a_folder_named_claude_without_electron_files_is_not_desktop_outside_the_standard_place(self):
+        alt = self.root / "cfg"
+        write(alt / "Claude" / "notes.txt", "mine")
+        self.ctx.env = {"XDG_CONFIG_HOME": str(alt)}
         self.assertEqual(cr.desktop_roots(self.ctx), [])
+        self.assertTrue(any(i.group == "unrecognised" for i in cr.residue(self.ctx)))
 
     def test_backup_errors_are_returned_and_each_backup_gets_its_own_folder(self):
         self.desktop()
@@ -487,3 +490,43 @@ class TestReviewFixes(Box):
         (self.home / ".config").mkdir(parents=True)
         os.symlink(target, self.home / ".config" / "Claude")
         self.assertTrue(any(i.kind == "manual" and i.group == "link" for i in cr.residue(self.ctx)))
+
+
+class TestSecondPass(Box):
+    def test_level2_finishes_even_without_the_mcp_config(self):
+        r = self.desktop()
+        os.unlink(r / "claude_desktop_config.json")
+        write(r / "plugin-mcp-auth" / "srv" / ".credentials.json", "{}")
+        write(r / "window-state.json", "{}")
+        res = cr.run_plan(self.ctx, cr.desktop_plan(self.ctx, 2))
+        self.assertEqual([x for x in res if x.status == "refused"], [])
+        for gone in ("plugin-mcp-auth", "logs", "window-state.json", "Local State"):
+            self.assertFalse((r / gone).exists(), gone)
+
+    def test_a_partial_level3_stays_visible_in_residue(self):
+        r = self.desktop()
+        write(r / "local-agent-mode-sessions" / "a" / "work" / ".git" / "HEAD", "ref")
+        cr.run_plan(self.ctx, cr.desktop_plan(self.ctx, 3))
+        self.assertTrue(cr.blocking(cr.residue(self.ctx)))
+
+    def test_custom_cache_home_with_user_files_is_not_a_cache(self):
+        write(self.home / "Documents" / "Claude" / "letter.txt", "dear")
+        self.ctx.env = {"XDG_CACHE_HOME": str(self.home / "Documents")}
+        self.assertEqual(cr.desktop_roots(self.ctx), [])
+        self.assertFalse(cr.deletable(self.ctx, str(self.home / "Documents" / "Claude"))[0])
+
+    def test_custom_config_home_needs_strong_markers(self):
+        write(self.home / "work" / "Claude" / "config.json", "{}")
+        write(self.home / "work" / "Claude" / "src" / "main.py", "print()")
+        self.ctx.env = {"XDG_CONFIG_HOME": str(self.home / "work")}
+        self.assertEqual(cr.desktop_roots(self.ctx), [])
+
+    def test_desktop_outside_dpkg_is_still_recognised(self):
+        self.sys.procs = [(20, "claude", "/opt/Claude/claude-desktop --type=gpu", "/opt/Claude/claude-desktop (deleted)")]
+        desk, code = cr.claude_running(self.ctx)
+        self.assertEqual((desk, code), ([20], []))
+
+    def test_an_open_browser_blocks_done(self):
+        TestBrowsers.chrome(self)
+        self.sys.procs = [(42, "chrome", "/opt/google/chrome/chrome")]
+        self.assertTrue(cr.blocking(cr.residue(self.ctx, no_traces=True)))

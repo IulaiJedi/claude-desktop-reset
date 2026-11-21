@@ -47,7 +47,8 @@ for _n in ["claude-code-sessions", "local-agent-mode-sessions", "git-shadow", "g
     GROUP_OF[_n] = "sessions"
 for _n in ["vm_bundles", "claude-code", "claude-code-vm"]:
     GROUP_OF[_n] = "runtime"
-ELECTRON_MARKERS = ("Local State", "Preferences", "config.json", "claude_desktop_config.json")
+ELECTRON_MARKERS = ("Local State", "claude_desktop_config.json")          # сильные признаки профиля Desktop
+CACHE_MARKERS = ("Cache", "Code Cache", "GPUCache", "Cache_Data", "DawnCache", "DawnGraphiteCache", "DawnWebGPUCache")
 LEVEL2_KEEP = {"claude_desktop_config.json", "Claude Extensions", "Claude Extensions Settings"}
 
 GROUP_INFO = {
@@ -101,12 +102,14 @@ class RealSys:
 
     def desktop_executables(self):
         """Файлы пакета claude-desktop — по ним и только по ним узнаётся запущенный Desktop."""
-        if not shutil.which("dpkg-query"):
-            return set()
-        code, out = self.run(["dpkg-query", "-L", "claude-desktop"])
-        if code != 0:
-            return set()
-        return {l.strip() for l in out.splitlines() if l.strip() and os.path.isfile(l.strip()) and os.access(l.strip(), os.X_OK)}
+        if getattr(self, "_exes", None) is not None:
+            return self._exes
+        self._exes = set()
+        if shutil.which("dpkg-query"):
+            code, out = self.run(["dpkg-query", "-L", "claude-desktop"])
+            if code == 0:
+                self._exes = {l.strip() for l in out.splitlines() if l.strip() and os.path.isfile(l.strip()) and os.access(l.strip(), os.X_OK)}
+        return self._exes
 
     def exe_of(self, pid):
         try:
@@ -137,6 +140,7 @@ class Ctx:
     env: dict = None
     run_id: str = field(default_factory=lambda: dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
     backups_made: int = 0
+    locked_roots: list = None
 
     def __post_init__(self):
         self.home = Path(self.home)
@@ -284,16 +288,33 @@ def remove_tree(path: str, errors: list, kept: list) -> bool:
 #  Корни данных Desktop и защита
 # ============================================================================
 
+def root_candidates(ctx):
+    """(вид, путь, стандартное место). В стандартном месте папка узнаётся по пути, в нестандартном — по признакам."""
+    cfg_default = norm(ctx.config_home) == norm(ctx.home / ".config")
+    cache_default = norm(ctx.cache_home) == norm(ctx.home / ".cache")
+    return [("desktop", norm(ctx.config_home / "Claude"), cfg_default), ("3p", norm(ctx.config_home / "Claude-3p"), cfg_default),
+            ("cache", norm(ctx.cache_home / "Claude"), cache_default)]
+
+
 def desktop_roots(ctx):
-    cands = [("desktop", ctx.config_home / "Claude"), ("3p", ctx.config_home / "Claude-3p"), ("cache", ctx.cache_home / "Claude")]
     out = []
-    for kind, p in cands:
-        s = norm(p)
+    for kind, s, default in root_candidates(ctx):
         if not (os.path.isdir(s) and not os.path.islink(s) and not link_on_path(s)):
             continue
-        if kind != "cache" and not any(os.path.lexists(os.path.join(s, m)) for m in ELECTRON_MARKERS):
-            continue        # папка с таким именем, но не данные Electron — не наша
-        out.append((kind, s))
+        markers = CACHE_MARKERS if kind == "cache" else ELECTRON_MARKERS
+        if default or any(os.path.lexists(os.path.join(s, m)) for m in markers):
+            out.append((kind, s))
+    return out
+
+
+def unrecognised_roots(ctx):
+    """Папки Claude в нестандартном месте (XDG) без признаков Desktop: не трогаются, показываются человеку."""
+    known = {r for _, r in desktop_roots(ctx)}
+    out = []
+    for kind, s, default in root_candidates(ctx):
+        if not default and os.path.isdir(s) and not os.path.islink(s) and s not in known:
+            out.append(Item("desktop", s, "manual", "unrecognised", f"{s} — папка Claude в нестандартном месте без признаков Desktop. "
+                            "Инструмент её не трогает; если это данные Desktop, удалите вручную.", "вручную"))
     return out
 
 
@@ -304,7 +325,7 @@ def link_roots(ctx):
         link = s if os.path.islink(s) else link_on_path(s)
         if link and os.path.exists(s):
             out.append(Item("desktop", s, "manual", "link", f"Папка данных Desktop лежит за ссылкой {link} -> {os.path.realpath(link)}. "
-                            "Инструмент по ссылкам не ходит — разберите вручную.", "вручную"))
+                            "Инструмент по ссылкам не ходит — разберите вручную.", "вручную", "", 0, "blocking"))
     return out
 
 
@@ -322,6 +343,9 @@ def code_auth_paths(ctx):
 
 
 def allowed_roots(ctx):
+    # На время выполнения плана корни зафиксированы: удалив признаки профиля, инструмент не перестаёт узнавать свою папку.
+    if ctx.locked_roots is not None:
+        return list(ctx.locked_roots)
     return [root for _, root in desktop_roots(ctx)]
 
 
@@ -651,7 +675,7 @@ def browser_plan(ctx):
     for bname, fam, procs, prof in browser_profiles(ctx):
         label = f"{bname}, профиль «{os.path.basename(prof)}»"
         if running & set(procs):
-            items.append(Item("browser", prof, "manual", "browser", f"Закройте {bname} и повторите — открытый браузер держит свои базы.", "вход", label))
+            items.append(Item("browser", prof, "manual", "browser", f"Закройте {bname} и повторите — открытый браузер держит свои базы.", "вход", label, 0, "blocking"))
             continue
         dbs = [(os.path.join(prof, "Network", "Cookies"), "chromium-cookies"), (os.path.join(prof, "Cookies"), "chromium-cookies")] if fam == "chromium" \
             else [(os.path.join(prof, "cookies.sqlite"), "firefox-cookies"), (os.path.join(prof, "webappsstore.sqlite"), "firefox-webapps")]
@@ -665,7 +689,7 @@ def browser_plan(ctx):
                 if n:
                     items.append(Item("browser", db, "sqlrows", "browser", f"Записи сайтов Claude: {n} ({label})", "вход", "Выход с claude.ai в этом браузере.", 0, detail))
             except sqlite3.Error as e:
-                items.append(Item("browser", prof, "manual", "browser", f"Не удалось прочитать {os.path.basename(db)}: {e}", "вход", label))
+                items.append(Item("browser", prof, "manual", "browser", f"Не удалось прочитать {os.path.basename(db)}: {e}", "вход", label, 0, "blocking"))
         parent = os.path.join(prof, "IndexedDB") if fam == "chromium" else os.path.join(prof, "storage", "default")
         if os.path.isdir(parent):
             for e in sorted(os.scandir(parent), key=lambda x: x.name):
@@ -700,7 +724,7 @@ def act_sqlrows(ctx, it):
         log(ctx, "REFUSED", db, "не база браузера")
         return Result(db, "refused", 0, "не база браузера")
     if {p[1] for p in ctx.sys.processes()} & set(prof[1]):
-        return Result(db, "manual", 0, f"{prof[0]} снова открыт — закройте его и повторите")
+        return Result(db, "failed", 0, f"{prof[0]} снова открыт — закройте его и повторите")
     try:
         con = sqlite3.connect(db)
         n = con.execute(f"DELETE FROM {SQL_TABLE[it.detail]} WHERE {sql_predicate(it.detail)}").rowcount
@@ -753,6 +777,17 @@ def run_plan(ctx, plan, allow_code_auth=False):
     order = {"logout": 0, "uninstall": 1}
     plan = sorted(plan, key=lambda i: order.get(i.kind, 2))
     res = []
+    outer = ctx.locked_roots is None
+    if outer:
+        ctx.locked_roots = allowed_roots(ctx)
+    try:
+        return _run_plan(ctx, plan, allow_code_auth, res)
+    finally:
+        if outer:
+            ctx.locked_roots = None
+
+
+def _run_plan(ctx, plan, allow_code_auth, res):
     for it in plan:
         if it.kind in ("dir", "file"):
             res.append(delete(ctx, it.path, allow_code_auth=allow_code_auth))
@@ -777,11 +812,11 @@ def no_traces_plan(ctx, uninstall=False, skip_browsers=False):
 
 def blocking(items):
     """Что мешает сказать «готово»: всё, кроме ручных шагов и файлов самого человека."""
-    return [i for i in items if i.kind != "manual" and i.area not in ("user-copies", "tool-copies")]
+    return [i for i in items if (i.kind != "manual" and i.area not in ("user-copies", "tool-copies")) or i.detail == "blocking"]
 
 
 def residue(ctx, no_traces=False):
-    out = [mk("desktop", r, "dir", "root", f"Данные Desktop ({k})", "остаток") for k, r in desktop_roots(ctx)] + link_roots(ctx)
+    out = [mk("desktop", r, "dir", "root", f"Данные Desktop ({k})", "остаток") for k, r in desktop_roots(ctx)] + link_roots(ctx) + unrecognised_roots(ctx)
     if no_traces:
         out += code_auth_plan(ctx) + browser_plan(ctx) + user_copies(ctx)
         bk = ctx.data_dir / "backup"
@@ -1012,8 +1047,8 @@ def claude_running(ctx):
         pid, name, cmd = p[0], p[1], p[2]
         if pid == os.getpid():
             continue
-        exe = ctx.sys.exe_of(pid)
-        if exe and exe in exes:
+        exe = (ctx.sys.exe_of(pid) or "").removesuffix(" (deleted)")      # после обновления пакета у живого процесса exe с хвостом
+        if exe and (exe in exes or re.search(r"(?i)claude[-_ ]?desktop", exe)):
             desk.append(pid)
         elif name == "claude" or "@anthropic-ai/claude-code" in cmd:
             code.append(pid)
@@ -1078,6 +1113,11 @@ def no_traces_flow(ctx):
     if any((Path(r) / "claude_desktop_config.json").is_file() for _, r in desktop_roots(ctx)) and yes("Сохранить список MCP-серверов Desktop (без данных аккаунта)?"):
         bdir, errs = make_backup(ctx, mcp_only=True)
         out(f"Сохранено: {bdir}" + (f" (ошибок: {len(errs)})" if errs else ""))
+        for e in errs[:5]:
+            out(f"  ошибка копии: {e}")
+        if errs and not yes("Список MCP сохранён с ошибками. Всё равно продолжить?"):
+            out("Отменено. Ничего не удалено.")
+            return
     plan = no_traces_plan(ctx, uninstall=uninstall)
     show_plan(ctx, out, plan, "Шаг 3. План чистки")
     if not word("Удалить всё перечисленное?"):
@@ -1088,7 +1128,8 @@ def no_traces_flow(ctx):
         return
     before = code_snapshot(ctx)
     res = run_plan(ctx, plan, allow_code_auth=True)
-    res += run_plan(ctx, [i for i in code_auth_plan(ctx) if i.kind != "manual"], allow_code_auth=True)   # что появилось после logout
+    tried = {x.path for x in res}
+    res += run_plan(ctx, [i for i in code_auth_plan(ctx) if i.kind != "manual" and norm(i.path) not in tried], allow_code_auth=True)   # появилось после logout
     show_results(out, res)
     for p in compare_snapshots(before, code_snapshot(ctx), auth_wizard=True):
         out(f"ВНИМАНИЕ: {p}")
