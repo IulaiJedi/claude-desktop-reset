@@ -737,7 +737,7 @@ Describe 'Review regressions' {
         New-FakeFile "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc\Settings\settings.dat" 'win'
         $sys.GetDesktopPackage = { throw 'AppX service unavailable' }
         $ctx = New-TestContext $m $sys
-        @(Get-CrDesktopPlan $ctx -Level 3 | Where-Object { $_.Path -like '*\Packages\Claude_pzs8sxrjxfjjc' }).Count | Should Be 0
+        @(Get-CrDesktopPlan $ctx -Level 3 | Where-Object { $_.Path -like '*\Packages\Claude_pzs8sxrjxfjjc' -and $_.Kind -ne 'manual' }).Count | Should Be 0
         (Test-CrDeletable $ctx "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc").Allowed | Should Be $false
     }
 
@@ -871,5 +871,71 @@ Describe 'Review regressions' {
         Test-Path -LiteralPath "$r\local-agent-mode-sessions\a\c\notes\CLAUDE.md" | Should Be $true
         Test-Path -LiteralPath "$r\Cache" | Should Be $false
         @($res | Where-Object { $_.Status -eq 'partial' }).Count | Should Be 1
+    }
+}
+
+# ---------- 11. Second review pass ----------
+
+Describe 'Second review pass' {
+    Mock Write-Host { }
+    Mock Read-Host { if ($global:CrAnswers.Count -eq 0) { throw "unexpected question: $Prompt" }; $global:CrAnswers.Dequeue() }
+
+    It 'N1: a successful uninstall stays successful when Windows then cannot report the state; the folder is shown as manual' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        New-FakeFile "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc\Settings\settings.dat" 'win'
+        $ctx = New-TestContext $m $sys
+        $sys.RemovePackage = { param($full) $sys.State.Package = $null; $sys.GetDesktopPackage = { throw 'state unclear' } }.GetNewClosure()
+        (Invoke-CrUninstallDesktop $ctx).Status | Should Be 'deleted'
+        $ctx.PackageState | Should Be 'unknown'
+        @(Get-CrResidue $ctx | Where-Object { $_.Kind -eq 'manual' -and $_.Path -like '*\Packages\Claude_pzs8sxrjxfjjc' }).Count | Should Be 1
+    }
+
+    It 'N2: when the old uninstaller fails, its program folder is not deleted' {
+        $m = New-FakeMachine; $sys = New-FakeSys -NoPackage
+        New-FakeFile "$($m.Paths.LocalAppData)\AnthropicClaude\Update.exe" 'exe'
+        New-FakeFile "$($m.Paths.LocalAppData)\AnthropicClaude\app-1.0\Claude.exe" 'exe'
+        $sys.RunProcess = { param($exe, $argList) @{ ExitCode = 1; Output = 'failed' } }
+        $ctx = New-TestContext $m $sys
+        $res = @(Invoke-CrPlan $ctx (Get-CrDesktopPlan $ctx -Level 3 -Uninstall))
+        Test-Path -LiteralPath "$($m.Paths.LocalAppData)\AnthropicClaude\app-1.0\Claude.exe" | Should Be $true
+        @($res | Where-Object { $_.Status -eq 'skipped' }).Count -gt 0 | Should Be $true
+    }
+
+    It 'N2: reinstall stops before touching data when the app cannot be removed' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        $sys.RemovePackage = { param($full) throw 'access denied' }
+        $ctx = New-TestContext $m $sys
+        $global:CrAnswers = New-Object System.Collections.Queue; foreach ($x in @('удалить', '')) { $global:CrAnswers.Enqueue($x) }
+        Invoke-CrReinstallFlow $ctx
+        Test-Path -LiteralPath "$r\config.json" | Should Be $true
+        $global:CrAnswers.Count | Should Be 0
+    }
+
+    It 'N3: audit still finishes when the process list cannot be read' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        $sys.GetProcesses = { throw 'WMI is broken' }
+        $ctx = New-TestContext $m $sys
+        { Invoke-CrAudit $ctx -NoPause } | Should Not Throw
+        @(Get-ChildItem -LiteralPath (Join-Path $ctx.DataDir 'reports') -Filter 'audit-*.txt').Count | Should Be 1
+    }
+
+    It 'N4: the leftover package folder names the other programs'' folders it holds' {
+        $m = New-FakeMachine; $sys = New-FakeSys -NoPackage
+        New-FakeFile "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\create-next-app-nodejs\Config\c.json" '{}'
+        $ctx = New-TestContext $m $sys
+        $item = @(Get-CrDesktopOutsideItems $ctx | Where-Object { $_.Group -eq 'package-folder' })[0]
+        $item.Consequence -match 'create-next-app-nodejs' | Should Be $true
+    }
+
+    It 'user copies match backup names, not words that merely contain "bak"' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        New-FakeFile "$($m.Paths.UserProfile)\claude-bake-off\recipe.txt" 'cake'
+        New-FakeFile "$($m.Paths.UserProfile)\claude-config.bak" 'x'
+        New-FakeFile "$($m.Paths.UserProfile)\claude-backups\a.tar.gz" 'x'
+        $ctx = New-TestContext $m $sys
+        $names = @(Get-CrUserCopies $ctx | ForEach-Object { Get-CrLeaf $_.Path } | Sort-Object)
+        ($names -join ',') | Should Be 'claude-backups,claude-config.bak'
     }
 }

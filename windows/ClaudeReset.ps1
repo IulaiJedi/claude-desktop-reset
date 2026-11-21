@@ -82,7 +82,10 @@ function New-CrRealSys {
             return $pkg
         }
         RemovePackage     = { param($full) Remove-AppxPackage -Package $full -ErrorAction Stop }
-        GetProcesses      = { Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = ($_.Name -replace '\.exe$', ''); Id = $_.ProcessId; Path = $_.ExecutablePath; CommandLine = $_.CommandLine } } }
+        GetProcesses      = {
+            try { Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = ($_.Name -replace '\.exe$', ''); Id = $_.ProcessId; Path = $_.ExecutablePath; CommandLine = $_.CommandLine } } }
+            catch { Get-Process -ErrorAction Stop | ForEach-Object { $p = $null; try { $p = $_.Path } catch { }; [pscustomobject]@{ Name = $_.ProcessName; Id = $_.Id; Path = $p; CommandLine = $null } } }
+        }
         IsAdmin           = { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
         GetService        = { param($n) Get-Service -Name $n -ErrorAction SilentlyContinue }
         StopService       = { param($n) Stop-Service -Name $n -Force -ErrorAction Stop }
@@ -552,10 +555,17 @@ function Get-CrDesktopOutsideItems($ctx) {
     if ([System.IO.Directory]::Exists($p.Temp)) {
         foreach ($f in (New-Object System.IO.DirectoryInfo $p.Temp).GetFiles('Claude-*.msix')) { & $add $f.FullName 'Скачанный установщик' }
     }
-    if ($ctx.PackageState -eq 'absent') {
-        $orphan = Join-Path $p.LocalAppData "Packages\$($script:CrKnownPfn)"
-        if (Get-CrItemInfo $orphan) {
-            [void]$items.Add((New-CrItem -Area 'desktop-outside' -RootKind 'msix' -Root $orphan -Path $orphan -Kind 'dir' -Group 'package-folder' -Purpose 'Папка снятого пакета Desktop' -Risk 'низкий' -Consequence 'Остаток приложения, которого уже нет.'))
+    $orphan = Join-Path $p.LocalAppData "Packages\$($script:CrKnownPfn)"
+    if (Get-CrItemInfo $orphan) {
+        $roaming = Join-Path $orphan 'LocalCache\Roaming'
+        $foreign = @()
+        if ([System.IO.Directory]::Exists($roaming)) { $foreign = @((New-Object System.IO.DirectoryInfo $roaming).GetDirectories() | Where-Object { @('Claude', 'Microsoft') -notcontains $_.Name } | ForEach-Object { $_.Name }) }
+        $note = if ($foreign.Count) { ' Внутри — папки других программ: ' + ($foreign -join ', ') + '; они уйдут вместе с ней.' } else { '' }
+        if ($ctx.PackageState -eq 'absent') {
+            [void]$items.Add((New-CrItem -Area 'desktop-outside' -RootKind 'msix' -Root $orphan -Path $orphan -Kind 'dir' -Group 'package-folder' -Purpose 'Папка снятого пакета Desktop' -Risk 'низкий' -Consequence ('Остаток приложения, которого уже нет.' + $note)))
+        }
+        elseif ($ctx.PackageState -eq 'unknown') {
+            [void]$items.Add((New-CrItem -Area 'desktop-outside' -RootKind 'msix' -Root $orphan -Path $orphan -Kind 'manual' -Group 'package-state' -Purpose 'Папка пакета Desktop: Windows не ответила, установлено ли приложение. Повторите проверку после перезагрузки.' -Risk 'вручную' -Consequence ('Не удаляется, пока состояние неясно.' + $note) -Bytes 0))
         }
     }
     return @($items)
@@ -626,7 +636,7 @@ function Optimize-CrPlan($plan) {
     return @($keep) + $rest
 }
 
-function Invoke-CrPlan($ctx, $plan, [switch]$AllowCodeAuth) {
+function Invoke-CrPlan($ctx, $plan, [switch]$AllowCodeAuth, [switch]$StopOnUninstallFailure) {
     $results = New-Object System.Collections.ArrayList
     $plan = @($plan | Where-Object { $_ })
     # Сначала обычные пункты, потом «удалить, если опустела».
@@ -635,7 +645,19 @@ function Invoke-CrPlan($ctx, $plan, [switch]$AllowCodeAuth) {
     $last = @($plan | Where-Object { $_.Group -eq 'package-folder' })
     $middle = @($plan | Where-Object { -not (@('logout', 'uninstall', 'emptydir') -contains $_.Kind) -and $_.Group -ne 'package-folder' })
     $ordered = $first + $middle + $last + @($plan | Where-Object { $_.Kind -eq 'emptydir' })
+    $uninstallFailed = $false
     foreach ($i in $ordered) {
+        if ($uninstallFailed -and ($StopOnUninstallFailure -or $i.Group -eq 'package-folder')) {
+            Write-CrLog $ctx 'SKIPPED' $i.Path 'приложение не удалилось'
+            [void]$results.Add([pscustomobject]@{ Path = $i.Path; Status = 'skipped'; Bytes = 0; Error = 'пропущено: приложение не удалилось' })
+            continue
+        }
+        if ($i.Kind -eq 'uninstall') {
+            $u = Invoke-CrAction_uninstall $ctx $i
+            [void]$results.Add($u)
+            if ($u.Status -eq 'failed') { $uninstallFailed = $true }
+            continue
+        }
         switch ($i.Kind) {
             'emptydir' { [void]$results.Add((Invoke-CrDelete $ctx $i.Path -OnlyIfEmpty)) }
             { @('dir', 'file') -contains $_ } { [void]$results.Add((Invoke-CrDelete $ctx $i.Path -AllowCodeAuth:$AllowCodeAuth)) }
@@ -840,7 +862,7 @@ function Get-CrUserCopies($ctx) {
     foreach ($e in (New-Object System.IO.DirectoryInfo $u).GetFileSystemInfos()) {
         $n = $e.Name
         if ($n -like '.claude.json*') { $isCopy = ($n -ne '.claude.json') -and ($n -notmatch '^\.claude\.json\.(backup|corrupted|tmp)(\.|$)') }
-        else { $isCopy = ($n -match '(?i)claude.*(backup|bak)') -and ($n -ne '.claude') }
+        else { $isCopy = ($n -match '(?i)claude.*(backup|(^|[-_.])bak([-_.]|$))') -and ($n -ne '.claude') }
         if ($isCopy) {
             $kind = if ($e -is [System.IO.DirectoryInfo]) { 'dir' } else { 'file' }
             [void]$items.Add((New-CrItem -Area 'user-copies' -RootKind 'user' -Root $u -Path $e.FullName -Kind $kind -Group 'user-copies' -Purpose 'Ваша копия настроек Claude — похоже, с данными входа' -Risk 'ваш файл' -Consequence 'Удаляется только по отдельному подтверждению.'))
@@ -1030,7 +1052,7 @@ function Find-CrClaudeInFiles([string]$Dir, [string]$Kind = 'origin') {
 
 function Get-CrBrowserPlan($ctx) {
     $items = New-Object System.Collections.ArrayList
-    $running = @(& $ctx.Sys.GetProcesses | ForEach-Object { $_.Name.ToLowerInvariant() } | Sort-Object -Unique)
+    $running = @((Get-CrProcessesSafe $ctx).List | ForEach-Object { ([string]$_.Name).ToLowerInvariant() } | Sort-Object -Unique)
     $manual = {
         param($pr, $text)
         [void]$items.Add((New-CrItem -Area 'browser' -RootKind $pr.Browser -Root $pr.Dir -Path $pr.Dir -Kind 'manual' -Group 'browser' -Purpose $text -Risk 'вход' -Consequence "$($pr.Browser), профиль «$($pr.Profile)»" -Bytes 0))
@@ -1211,16 +1233,14 @@ function New-CrBackup($ctx, [switch]$McpOnly, [switch]$IncludeCoworkDisk) {
 function Invoke-CrUninstallDesktop($ctx) {
     if ($ctx.Package) {
         $full = $ctx.Package.PackageFullName
-        try {
-            & $ctx.Sys.RemovePackage $full
-            Write-CrLog $ctx 'UNINSTALLED' $full 'MSIX'
-            $ctx.Package = & $ctx.Sys.GetDesktopPackage
-            return [pscustomobject]@{ Path = $full; Status = 'deleted'; Bytes = 0; Error = '' }
-        }
+        try { & $ctx.Sys.RemovePackage $full }
         catch {
             Write-CrLog $ctx 'FAILED' $full $_.Exception.Message
             return [pscustomobject]@{ Path = $full; Status = 'failed'; Bytes = 0; Error = $_.Exception.Message }
         }
+        Write-CrLog $ctx 'UNINSTALLED' $full 'MSIX'
+        Update-CrPackage $ctx                     # сбой этого запроса — не провал удаления
+        return [pscustomobject]@{ Path = $full; Status = 'deleted'; Bytes = 0; Error = '' }
     }
     $update = Join-Path $ctx.Paths.LocalAppData 'AnthropicClaude\Update.exe'
     if ([System.IO.File]::Exists($update)) {
@@ -1390,6 +1410,8 @@ function Show-CrResults($ctx, $Results) {
     $r = @($Results | Where-Object { $_ })
     $freed = Get-CrSum ($r | Where-Object { @('deleted', 'partial') -contains $_.Status }) 'Bytes'
     Out-CrLine ''
+    $skipped = @($r | Where-Object { $_.Status -eq 'skipped' }).Count
+    if ($skipped) { Out-CrLine "  Пропущено из-за неудачного удаления приложения: $skipped" 'Yellow' }
     Out-CrLine ('Выполнено. Удалено: {0}, освобождено: {1}. Отказано защитой: {2}. Ошибок: {3}. Вручную: {4}.' -f
         @($r | Where-Object { $_.Status -eq 'deleted' }).Count, (Format-CrSize $freed), @($r | Where-Object { $_.Status -eq 'refused' }).Count,
         @($r | Where-Object { $_.Status -eq 'failed' }).Count, @($r | Where-Object { $_.Status -eq 'manual' }).Count) 'Green'
@@ -1414,10 +1436,18 @@ function Read-CrWord([string]$Prompt) {
     return @('удалить', 'delete') -contains ([string]$a).Trim().ToLowerInvariant()
 }
 
+function Get-CrProcessesSafe($ctx) {
+    # Ok = $false — список прочитать не удалось; это не то же, что «ничего не запущено».
+    try { return @{ Ok = $true; List = @(& $ctx.Sys.GetProcesses | Where-Object { $_ }) } }
+    catch { Write-CrLog $ctx 'WARN' 'processes' $_.Exception.Message; return @{ Ok = $false; List = @() } }
+}
+
 function Get-CrClaudeProcesses($ctx) {
     $roots = @(Get-CrDesktopRoots $ctx | ForEach-Object { $_.Path })
     $desktop = New-Object System.Collections.ArrayList; $code = New-Object System.Collections.ArrayList
-    foreach ($p in @(& $ctx.Sys.GetProcesses)) {
+    $procs = Get-CrProcessesSafe $ctx
+    if (-not $procs.Ok) { return @{ Desktop = @(); Code = @(); Unknown = $true } }
+    foreach ($p in $procs.List) {
         $cmd = if ($p.PSObject.Properties['CommandLine']) { [string]$p.CommandLine } else { '' }
         if ($p.Name -ieq 'node' -and $cmd -match '@anthropic-ai[\\/]claude-code') { [void]$code.Add($p); continue }
         if ($p.Name -notmatch '^(?i)claude$|^cowork-svc$') { continue }
@@ -1426,7 +1456,7 @@ function Get-CrClaudeProcesses($ctx) {
         if ($p.Name -ieq 'cowork-svc') { continue }          # служба — отдельно
         if ($isDesktop) { [void]$desktop.Add($p) } else { [void]$code.Add($p) }
     }
-    return @{ Desktop = @($desktop); Code = @($code) }
+    return @{ Desktop = @($desktop); Code = @($code); Unknown = $false }
 }
 
 function Wait-CrClosed($ctx, [switch]$Desktop, [switch]$Code, [switch]$Browsers) {
@@ -1434,12 +1464,17 @@ function Wait-CrClosed($ctx, [switch]$Desktop, [switch]$Code, [switch]$Browsers)
     $skip = $false
     while ($true) {
         $pr = Get-CrClaudeProcesses $ctx
+        if ($pr.Unknown) {
+            Out-CrLine 'Не удалось прочитать список процессов. Убедитесь сами, что закрыты Claude Desktop, Claude Code и браузеры.' 'Yellow'
+            $a = ([string](Read-Host 'Закрыли — нажмите Enter (q — отмена)')).Trim().ToLowerInvariant()
+            if ($a -eq 'q') { return 'cancel' } else { return 'ok' }
+        }
         $open = New-Object System.Collections.ArrayList
         $openBrowsers = New-Object System.Collections.ArrayList
         if ($Desktop -and $pr.Desktop.Count) { [void]$open.Add('Claude Desktop (меню ☰ → File → Exit; значок в трее тоже)') }
         if ($Code -and $pr.Code.Count) { [void]$open.Add('Claude Code во всех терминалах — иначе он запишет данные входа обратно') }
         if ($Browsers -and -not $skip) {
-            $names = @(& $ctx.Sys.GetProcesses | ForEach-Object { ([string]$_.Name).ToLowerInvariant() })
+            $names = @((Get-CrProcessesSafe $ctx).List | ForEach-Object { ([string]$_.Name).ToLowerInvariant() })
             foreach ($b in (Get-CrBrowserProfiles $ctx | Select-Object -ExpandProperty Browser -Unique)) {
                 $proc = ($script:CrBrowsers | Where-Object { $_.Name -eq $b } | Select-Object -First 1).Proc
                 if ($names -contains $proc) { [void]$openBrowsers.Add($b) }
@@ -1532,7 +1567,8 @@ function Invoke-CrAudit($ctx, [switch]$NoPause) {
     $svc = & $ctx.Sys.GetService 'CoworkVMService'
     if ($svc) { Out-CrLine "  Служба Cowork (CoworkVMService): $($svc.Status)" 'White' }
     $pr = Get-CrClaudeProcesses $ctx
-    if ($pr.Desktop.Count) { Out-CrLine "  Сейчас запущен: да ($($pr.Desktop.Count) процессов)" 'Yellow' }
+    if ($pr.Unknown) { Out-CrLine '  Список процессов прочитать не удалось — запущен ли Desktop, неизвестно.' 'Yellow' }
+    elseif ($pr.Desktop.Count) { Out-CrLine "  Сейчас запущен: да ($($pr.Desktop.Count) процессов)" 'Yellow' }
 
     $all = New-Object System.Collections.ArrayList
     $inv = @(Get-CrDesktopInventory $ctx)
@@ -1737,11 +1773,14 @@ function Invoke-CrReinstallFlow($ctx) {
     Write-CrLog $ctx 'CONFIRMED' 'reinstall' "пунктов: $($plan.Count)"
     Stop-CrCoworkService $ctx
     $before = Get-CrCodeSnapshot $ctx
-    $results = @(Invoke-CrPlan $ctx $plan)
+    $results = @(Invoke-CrPlan $ctx $plan -StopOnUninstallFailure)
     Show-CrResults $ctx $results
-    Update-CrPackage $ctx
-    if ($ctx.PackageState -ne 'absent' -and -not [System.IO.Directory]::Exists((Join-Path $ctx.Paths.LocalAppData 'AnthropicClaude'))) {
-        if ($ctx.Package) { Out-CrLine 'Приложение удалить не вышло. Запустите инструмент от имени администратора и повторите.' 'Yellow' }
+    if (@($results | Where-Object { $_.Status -eq 'skipped' }).Count) {
+        Out-CrLine 'Приложение удалить не вышло, данные не тронуты. Запустите инструмент от имени администратора и повторите.' 'Yellow'
+        $file = Save-CrReport $ctx 'reinstall' $plan
+        Write-Host "Отчёт: $file" -ForegroundColor Green
+        [void](Read-Host 'Enter — в меню')
+        return
     }
     Show-CrResidue $ctx -NoPause
     Out-CrLine 'Установите Claude Desktop: https://claude.ai/download — и нажмите Enter, когда установка закончится.' 'Cyan'
