@@ -472,6 +472,15 @@ class TestReviewFixes(Box):
         os.mkfifo(r / "Cache" / "pipe")
         self.assertEqual(cr.delete(self.ctx, str(r / "Cache")).status, "deleted")
 
+    def test_an_explicitly_allowed_path_through_a_link_is_still_refused(self):
+        outside = self.root / "outside"
+        write(outside / "claude-config-backup.tar.gz", "x")
+        os.symlink(outside, self.home / "lnk")
+        target = str(self.home / "lnk" / "claude-config-backup.tar.gz")
+        self.ctx.extra_allowed.add(target)
+        self.assertEqual(cr.delete(self.ctx, target).status, "refused")
+        self.assertTrue((outside / "claude-config-backup.tar.gz").exists())
+
     def test_link_root_is_reported_for_a_human(self):
         target = self.root / "elsewhere"
         write(target / "Local State", "{}")
