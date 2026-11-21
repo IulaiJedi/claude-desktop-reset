@@ -334,3 +334,89 @@ Describe 'Level 3 outside the data folder' {
         { New-CrContext -Paths $m.Paths -SandboxRoot $m.Root -DataDir (Join-Path $m.Root 'out') } | Should Throw
     }
 }
+
+# ---------- 5. Claude Code: only the sign-in goes ----------
+
+Describe 'Claude Code sign-in cleanup' {
+    function New-CodeAuthMachine {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        New-FakeClaudeCode $m
+        $u = $m.Paths.UserProfile
+        New-FakeFile "$u\.claude\telemetry\1p_failed_events.a.json" '{}'
+        New-FakeFile "$u\.claude\mcp-needs-auth-cache.json" '{}'
+        New-FakeFile "$u\.claude\backups\.claude.json.backup.1794358048972" '{"oauthAccount":{}}'
+        New-FakeFile "$u\.claude\backups\my-own-folder\notes.txt" 'mine'
+        New-FakeFile "$u\.claude.json.backup" '{"oauthAccount":{}}'
+        New-FakeFile "$u\.claude.json.bak-20260527" '{"oauthAccount":{}}'
+        New-FakeFile "$u\claude-config-backup.tar.gz" 'archive'
+        New-FakeFile "$($m.Paths.AppData)\Anthropic\profile.json" '{}'
+        $sys.State.UserEnv['ANTHROPIC_API_KEY'] = 'sk-ant-xxx'
+        $sys.State.UserEnv['PATH'] = 'C:\x'
+        return @{ M = $m; Sys = $sys; Ctx = (New-TestContext $m $sys) }
+    }
+
+    It 'strips account data from .claude.json but keeps projects and MCP servers' {
+        $t = New-CodeAuthMachine
+        $plan = @(Get-CrCodeAuthPlan $t.Ctx)
+        $null = Invoke-CrPlan $t.Ctx $plan -AllowCodeAuth
+        $j = Get-Content -LiteralPath "$($t.M.Paths.UserProfile)\.claude.json" -Raw | ConvertFrom-Json
+        $names = @($j.PSObject.Properties.Name)
+        $names -contains 'oauthAccount' | Should Be $false
+        $names -contains 'userID' | Should Be $false
+        $names -contains 'machineID' | Should Be $false
+        $names -contains 'cachedGrowthBookFeatures' | Should Be $false
+        $names -contains 'projects' | Should Be $true
+        $names -contains 'mcpServers' | Should Be $true
+        $j.numStartups | Should Be 5
+    }
+
+    It 'deletes tokens, telemetry and Claude-made copies, keeps the work' {
+        $t = New-CodeAuthMachine
+        $u = $t.M.Paths.UserProfile
+        $before = Get-CrCodeSnapshot $t.Ctx
+        $null = Invoke-CrPlan $t.Ctx @(Get-CrCodeAuthPlan $t.Ctx) -AllowCodeAuth
+        $after = Get-CrCodeSnapshot $t.Ctx
+
+        foreach ($gone in @("$u\.claude\.credentials.json", "$u\.claude\telemetry", "$u\.claude\mcp-needs-auth-cache.json",
+                "$u\.claude\backups\.claude.json.backup.1794358048972", "$u\.claude.json.backup", "$($t.M.Paths.AppData)\Anthropic")) {
+            Test-Path -LiteralPath $gone | Should Be $false
+        }
+        foreach ($kept in @("$u\.claude\settings.json", "$u\.claude\CLAUDE.md", "$u\.claude\projects\C--projects-a\s1.jsonl",
+                "$u\.claude\projects\C--projects-a\memory\MEMORY.md", "$u\.claude\skills\sdd\SKILL.md", "$u\.claude\backups\my-own-folder\notes.txt",
+                "$u\.local\bin\claude.exe", "$u\.claude.json.bak-20260527", "$u\claude-config-backup.tar.gz")) {
+            Test-Path -LiteralPath $kept | Should Be $true
+        }
+        @(Compare-CrCodeSnapshot $before $after -AuthWizard).Count | Should Be 0
+    }
+
+    It 'removes only Claude token variables from the user environment' {
+        $t = New-CodeAuthMachine
+        $null = Invoke-CrPlan $t.Ctx @(Get-CrCodeAuthPlan $t.Ctx) -AllowCodeAuth
+        $t.Sys.State.UserEnv.ContainsKey('ANTHROPIC_API_KEY') | Should Be $false
+        $t.Sys.State.UserEnv['PATH'] | Should Be 'C:\x'
+    }
+
+    It 'lists the user''s own copies separately and deletes one only when explicitly allowed' {
+        $t = New-CodeAuthMachine
+        $u = $t.M.Paths.UserProfile
+        $copies = @(Get-CrUserCopies $t.Ctx | ForEach-Object { Split-Path -Leaf $_.Path } | Sort-Object)
+        ($copies -join ',') | Should Be '.claude.json.bak-20260527,claude-config-backup.tar.gz'
+        (Invoke-CrDelete $t.Ctx "$u\claude-config-backup.tar.gz").Status | Should Be 'refused'
+        $t.Ctx.ExtraAllowed = @("$u\claude-config-backup.tar.gz")
+        (Invoke-CrDelete $t.Ctx "$u\claude-config-backup.tar.gz").Status | Should Be 'deleted'
+        (Invoke-CrDelete $t.Ctx "$u\.claude.json").Status | Should Be 'refused'
+    }
+
+    It 'never deletes the CLI sign-in outside the wizard' {
+        $t = New-CodeAuthMachine
+        (Invoke-CrDelete $t.Ctx "$($t.M.Paths.UserProfile)\.claude\.credentials.json").Status | Should Be 'refused'
+    }
+
+    It 'asks the CLI to sign out first, through the official command' {
+        $t = New-CodeAuthMachine
+        $t.Sys.FindClaudeCli = { @('C:\Users\u\.local\bin\claude.exe') }
+        $r = Invoke-CrClaudeLogout $t.Ctx
+        $r.Ran | Should Be $true
+        ($t.Sys.State.Log -join "`n") -match 'Run C:\\Users\\u\\.local\\bin\\claude.exe auth logout' | Should Be $true
+    }
+}

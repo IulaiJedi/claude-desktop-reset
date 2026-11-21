@@ -287,7 +287,7 @@ function Get-CrCodeAuthPaths($ctx) {
     foreach ($dir in @((Join-Path $u '.claude\backups'), $u)) {
         if ([System.IO.Directory]::Exists($dir)) {
             foreach ($f in (New-Object System.IO.DirectoryInfo $dir).GetFiles()) {
-                if ($f.Name -match '^\.claude\.json\.(backup|corrupted)\.') { [void]$list.Add($f.FullName) }
+                if ($f.Name -match '^\.claude\.json\.(backup|corrupted|tmp)\.') { [void]$list.Add($f.FullName) }
             }
         }
     }
@@ -348,7 +348,10 @@ function Test-CrDeletable($ctx, [string]$Path, [switch]$AllowCodeAuth, [switch]$
         foreach ($deny in @((Join-Path $u '.claude'), (Join-Path $u '.local'), (Join-Path $p.LocalAppData 'wsl'))) {
             if (Test-CrUnder $full (Get-CrFullPath $deny)) { return @{ Allowed = $false; Reason = "стоп-лист: $deny" } }
         }
-        if ($leaf -like '.claude.json*' -and ((Split-Path -Parent $full) -ieq (Get-CrFullPath $u))) { return @{ Allowed = $false; Reason = 'стоп-лист: .claude.json' } }
+    }
+    if ((Split-Path -Parent $full) -ieq (Get-CrFullPath $u)) {
+        if ($leaf -ieq '.claude.json') { return @{ Allowed = $false; Reason = 'стоп-лист: .claude.json правится, а не удаляется' } }
+        if ($leaf -like '.claude.json*' -and -not ($isCodeAuth -or ($extra -icontains $full))) { return @{ Allowed = $false; Reason = 'стоп-лист: копия .claude.json' } }
     }
     $pkgs = Get-CrFullPath (Join-Path $p.LocalAppData 'Packages')
     if (Test-CrUnder $full $pkgs) {
@@ -576,6 +579,125 @@ function Invoke-CrAction_regvalue($ctx, $item) {
     }
     try { & $ctx.Sys.RegRemoveValue $key $name; Write-CrLog $ctx 'REG-DELETED' $item.Path ''; return [pscustomobject]@{ Path = $item.Path; Status = 'deleted'; Bytes = 0; Error = '' } }
     catch { Write-CrLog $ctx 'FAILED' $item.Path $_.Exception.Message; return [pscustomobject]@{ Path = $item.Path; Status = 'failed'; Bytes = 0; Error = $_.Exception.Message } }
+}
+
+# ============================================================================
+#  Claude Code: уходит только вход
+# ============================================================================
+
+$script:CrAccountKeys = @('oauthAccount', 'userID', 'machineID', 'anonymousId', 'primaryApiKey', 'customApiKeyResponses',
+    'hasAvailableSubscription', 'subscriptionNoticeCount', 'claudeCodeFirstTokenDate', 'penguinModeOrgEnabled',
+    'claudeAiMcpEverConnected', 'passesLastSeenRemaining', 'passesUpsellSeenCount', 'hasVisitedPasses', 'clientDataCacheSlots')
+$script:CrTokenEnvVars = @('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN')
+
+function Get-CrJsonSerializer {
+    Add-Type -AssemblyName System.Web.Extensions
+    $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $ser.MaxJsonLength = [int]::MaxValue
+    $ser.RecursionLimit = 1000
+    return $ser
+}
+
+function Get-CrClaudeJsonStripKeys([string]$Path) {
+    # Ключи аккаунта, идентификаторы и кэши ответов сервера — по имени, без значений.
+    if (-not [System.IO.File]::Exists($Path)) { return @() }
+    $ser = Get-CrJsonSerializer
+    $obj = $ser.DeserializeObject([System.IO.File]::ReadAllText($Path))
+    if (-not ($obj -is [System.Collections.Generic.IDictionary[string, object]])) { return @() }
+    return @($obj.Keys | Where-Object { ($script:CrAccountKeys -contains $_) -or ($_ -clike 'cached*') -or ($_ -clike '*Cache') } | Sort-Object)
+}
+
+function Get-CrCodeAuthPlan($ctx) {
+    $items = New-Object System.Collections.ArrayList
+    foreach ($path in (Get-CrCodeAuthPaths $ctx)) {
+        $info = Get-CrItemInfo $path
+        if (-not $info) { continue }
+        $kind = if ($info -is [System.IO.DirectoryInfo]) { 'dir' } else { 'file' }
+        $purpose = switch -Wildcard ((Split-Path -Leaf $path)) {
+            '.credentials.json' { 'Токены входа Claude Code и MCP-серверов' }
+            'telemetry' { 'Неотправленная телеметрия' }
+            'Anthropic' { 'Вход в Console (без API-ключа)' }
+            '.claude.json.*' { 'Копия .claude.json с данными аккаунта (сделана Claude)' }
+            default { 'Состояние входа Claude Code' }
+        }
+        [void]$items.Add((New-CrItem -Area 'code-auth' -RootKind 'code' -Root $path -Path $path -Kind $kind -Group 'code-auth' -Purpose $purpose -Risk 'высокий' -Consequence 'Claude Code попросит войти заново; MCP-серверы — тоже.'))
+    }
+    $cj = Join-Path $ctx.Paths.UserProfile '.claude.json'
+    $keys = @(Get-CrClaudeJsonStripKeys $cj)
+    if ($keys.Count -gt 0) {
+        [void]$items.Add((New-CrItem -Area 'code-auth' -RootKind 'code' -Root $cj -Path $cj -Kind 'jsonstrip' -Group 'code-auth' -Purpose ('Из .claude.json уйдут ключи: ' + ($keys -join ', ')) -Risk 'средний' -Consequence 'Проекты, MCP-серверы и настройки в файле остаются.' -Bytes 0))
+    }
+    foreach ($n in $script:CrTokenEnvVars) {
+        if (& $ctx.Sys.GetUserEnv $n) {
+            [void]$items.Add((New-CrItem -Area 'code-auth' -RootKind 'env' -Root 'HKCU\Environment' -Path $n -Kind 'userenv' -Group 'code-auth' -Purpose "Переменная среды $n с токеном" -Risk 'высокий' -Consequence 'Программы, читающие эту переменную, потеряют ключ.' -Bytes 0))
+        }
+    }
+    return @($items)
+}
+
+function Invoke-CrAction_jsonstrip($ctx, $item) {
+    $cj = Get-CrFullPath (Join-Path $ctx.Paths.UserProfile '.claude.json')
+    if ((Get-CrFullPath $item.Path) -ine $cj) { return [pscustomobject]@{ Path = $item.Path; Status = 'refused'; Bytes = 0; Error = 'правится только .claude.json' } }
+    Assert-CrInSandbox $ctx $cj
+    try {
+        $ser = Get-CrJsonSerializer
+        $text = [System.IO.File]::ReadAllText($cj)
+        $obj = $ser.DeserializeObject($text)
+        $keys = @(Get-CrClaudeJsonStripKeys $cj)
+        $copyDir = Join-Path $ctx.DataDir "backup\$($ctx.RunId)\claude-code"
+        [void][System.IO.Directory]::CreateDirectory($copyDir)
+        [System.IO.File]::Copy($cj, (Join-Path $copyDir '.claude.json.original'), $true)
+        foreach ($k in $keys) { [void]$obj.Remove($k) }
+        $out = $ser.Serialize($obj)
+        $null = $ser.DeserializeObject($out)          # проверка, что получился корректный JSON
+        $tmp = "$cj.claudereset-tmp"
+        [System.IO.File]::WriteAllText($tmp, $out, (New-Object System.Text.UTF8Encoding $false))
+        [System.IO.File]::Replace($tmp, $cj, [NullString]::Value)
+        Write-CrLog $ctx 'JSON-STRIPPED' $cj ($keys -join ', ')
+        return [pscustomobject]@{ Path = $cj; Status = 'deleted'; Bytes = 0; Error = '' }
+    }
+    catch {
+        Write-CrLog $ctx 'FAILED' $cj $_.Exception.Message
+        return [pscustomobject]@{ Path = $cj; Status = 'failed'; Bytes = 0; Error = $_.Exception.Message }
+    }
+}
+
+function Invoke-CrAction_userenv($ctx, $item) {
+    if (-not ($script:CrTokenEnvVars -contains $item.Path)) { return [pscustomobject]@{ Path = $item.Path; Status = 'refused'; Bytes = 0; Error = 'не переменная Claude' } }
+    try { & $ctx.Sys.RemoveUserEnv $item.Path; Write-CrLog $ctx 'ENV-REMOVED' $item.Path ''; return [pscustomobject]@{ Path = $item.Path; Status = 'deleted'; Bytes = 0; Error = '' } }
+    catch { Write-CrLog $ctx 'FAILED' $item.Path $_.Exception.Message; return [pscustomobject]@{ Path = $item.Path; Status = 'failed'; Bytes = 0; Error = $_.Exception.Message } }
+}
+
+function Get-CrUserCopies($ctx) {
+    # Копии, сделанные самим человеком: показываются, удаляются только по отдельному «да».
+    $u = $ctx.Paths.UserProfile
+    $items = New-Object System.Collections.ArrayList
+    if (-not [System.IO.Directory]::Exists($u)) { return @() }
+    foreach ($e in (New-Object System.IO.DirectoryInfo $u).GetFileSystemInfos()) {
+        $n = $e.Name
+        if ($n -like '.claude.json*') { $isCopy = ($n -ne '.claude.json') -and ($n -notmatch '^\.claude\.json\.(backup|corrupted|tmp)(\.|$)') }
+        else { $isCopy = ($n -match '(?i)claude.*(backup|bak)') -and ($n -ne '.claude') }
+        if ($isCopy) {
+            $kind = if ($e -is [System.IO.DirectoryInfo]) { 'dir' } else { 'file' }
+            [void]$items.Add((New-CrItem -Area 'user-copies' -RootKind 'user' -Root $u -Path $e.FullName -Kind $kind -Group 'user-copies' -Purpose 'Ваша копия настроек Claude — похоже, с данными входа' -Risk 'ваш файл' -Consequence 'Удаляется только по отдельному подтверждению.'))
+        }
+    }
+    return @($items)
+}
+
+function Invoke-CrClaudeLogout($ctx) {
+    # Штатный выход Claude Code: сам стирает учётные данные, входы MCP и секреты плагинов.
+    $exe = @(& $ctx.Sys.FindClaudeCli) | Select-Object -First 1
+    if (-not $exe) {
+        foreach ($root in (Get-CrDesktopRoots $ctx)) {
+            $bundled = Get-CrFilesUnder (Join-Path $root.Path 'claude-code') 'claude.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+            if ($bundled) { $exe = $bundled.FullName; break }
+        }
+    }
+    if (-not $exe) { Write-CrLog $ctx 'LOGOUT' '' 'Claude Code не найден'; return @{ Ran = $false; Exe = $null; ExitCode = $null; Output = '' } }
+    $r = & $ctx.Sys.RunProcess $exe @('auth', 'logout')
+    Write-CrLog $ctx 'LOGOUT' $exe ("код выхода $($r.ExitCode)")
+    return @{ Ran = $true; Exe = $exe; ExitCode = $r.ExitCode; Output = $r.Output }
 }
 
 # ============================================================================
