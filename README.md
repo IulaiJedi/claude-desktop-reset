@@ -103,3 +103,7 @@ docs/HANDOFF.md     состояние проекта
 [Instagram](https://www.instagram.com/iulaijedi/) ·
 [GitHub](https://github.com/IulaiJedi) ·
 [LinkedIn](https://www.linkedin.com/in/iulai-atangulov-2164a7238/)
+
+## Поддержать
+
+Поддержать USDT TRC20 (Tron) - `TXJMsWQKTATbSyoFsxc2zwc4ytc1QvzyLB`
