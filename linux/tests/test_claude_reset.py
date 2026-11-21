@@ -264,6 +264,8 @@ class TestBrowsers(Box):
         c.execute("CREATE TABLE cookies(host_key TEXT, name TEXT, encrypted_value BLOB)")
         for h in [".claude.ai", "claude.ai", "platform.claude.com", ".anthropic.com", "notclaude.ai", ".google.com"]:
             c.execute("INSERT INTO cookies VALUES(?,?,?)", (h, "sid", b"\x00"))
+        for n in range(3000):       # много страниц: без VACUUM после удаления останутся свободные страницы
+            c.execute("INSERT INTO cookies VALUES(?,?,?)", (f"s{n}.claude.ai", "sid", b"z" * 200))
         c.commit(); c.close()
         write(p / "IndexedDB" / "https_claude.ai_0.indexeddb.leveldb" / "1.log", "i")
         write(p / "IndexedDB" / "https_mail.google.com_0.indexeddb.leveldb" / "1.log", "keep")
@@ -277,6 +279,9 @@ class TestBrowsers(Box):
         left = sorted(r[0] for r in c.execute("SELECT host_key FROM cookies"))
         c.close()
         self.assertEqual(left, [".google.com", "notclaude.ai"])
+        c = sqlite3.connect(p / "Cookies")
+        self.assertEqual(c.execute("PRAGMA freelist_count").fetchone()[0], 0)      # VACUUM вычистил освобождённые страницы
+        c.close()
         self.assertNotIn(b"platform.claude.com", (p / "Cookies").read_bytes())
         self.assertFalse((p / "IndexedDB" / "https_claude.ai_0.indexeddb.leveldb").exists())
         self.assertTrue((p / "IndexedDB" / "https_mail.google.com_0.indexeddb.leveldb").exists())
