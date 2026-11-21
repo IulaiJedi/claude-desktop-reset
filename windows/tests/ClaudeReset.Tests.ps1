@@ -9,6 +9,13 @@ function New-FakeFile([string]$Path, [string]$Content = 'x') {
     [System.IO.File]::WriteAllText($Path, $Content)
 }
 
+function New-FakeLongFile([string]$Dir, [int]$Depth = 8) {
+    $d = $Dir + (('\' + ('L' * 48)) * $Depth)
+    [void][System.IO.Directory]::CreateDirectory('\\?\' + $d)
+    [System.IO.File]::WriteAllText('\\?\' + $d + '\long.txt', ('z' * 1000))
+    return $d + '\long.txt'
+}
+
 function New-FakeMachine {
     $root = Join-Path $TestDrive ('m' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     $u = Join-Path $root 'Users\u'
@@ -389,9 +396,10 @@ Describe 'Claude Code sign-in cleanup' {
         @(Compare-CrCodeSnapshot $before $after -AuthWizard).Count | Should Be 0
     }
 
-    It 'removes only Claude token variables from the user environment' {
+    It 'removes only Claude token variables from the user environment, as a separate list' {
         $t = New-CodeAuthMachine
-        $null = Invoke-CrPlan $t.Ctx @(Get-CrCodeAuthPlan $t.Ctx) -AllowCodeAuth
+        @(Get-CrCodeAuthPlan $t.Ctx | Where-Object { $_.Kind -eq 'userenv' }).Count | Should Be 0
+        $null = Invoke-CrPlan $t.Ctx @(Get-CrTokenEnvItems $t.Ctx)
         $t.Sys.State.UserEnv.ContainsKey('ANTHROPIC_API_KEY') | Should Be $false
         $t.Sys.State.UserEnv['PATH'] | Should Be 'C:\x'
     }
@@ -648,8 +656,12 @@ Describe 'Menu flows (scripted answers)' {
 
     It 'no-traces wizard: uninstall, wipe, keep the work' {
         $t = New-FullMachine
-        Set-Answers @('нет', 'да', 'да', 'удалить', 'да', '')
+        $t.Sys.FindClaudeCli = { @('C:\Users\u\.local\bin\claude.exe') }
+        $t.Sys.State.UserEnv['ANTHROPIC_API_KEY'] = 'sk-ant'
+        Set-Answers @('нет', 'да', 'да', 'удалить', 'нет', '')
         Invoke-CrNoTracesWizard $t.Ctx
+        ($t.Sys.State.Log -join "`n") -match 'auth logout' | Should Be $true
+        $t.Sys.State.UserEnv['ANTHROPIC_API_KEY'] | Should Be 'sk-ant'
         $u = $t.M.Paths.UserProfile
         ($t.Sys.State.Log -join "`n") -match 'RemovePackage' | Should Be $true
         Test-Path -LiteralPath $t.Root | Should Be $false
@@ -658,7 +670,7 @@ Describe 'Menu flows (scripted answers)' {
         Test-Path -LiteralPath "$u\.claude\CLAUDE.md" | Should Be $true
         Test-Path -LiteralPath "$($t.M.Paths.LocalAppData)\Google\Chrome\User Data\Default\IndexedDB\https_claude.ai_0.indexeddb.leveldb" | Should Be $false
         @(Get-ChildItem -LiteralPath (Join-Path $t.Ctx.DataDir 'backup') -Recurse -Filter 'mcpServers-*.json').Count | Should Be 1
-        Test-Path -LiteralPath (Join-Path $t.Ctx.DataDir "backup\$($t.Ctx.RunId)\claude-code") | Should Be $false
+        @(Get-ChildItem -LiteralPath $t.Ctx.DataDir -Recurse -Filter '*.original').Count | Should Be 0
         $global:CrAnswers.Count | Should Be 0
     }
 
@@ -667,5 +679,197 @@ Describe 'Menu flows (scripted answers)' {
         Set-Answers @('7', '', '42', '0')
         Start-CrMenu $t.Ctx
         $global:CrAnswers.Count | Should Be 0
+    }
+}
+
+# ---------- 10. Regressions from the independent review ----------
+
+Describe 'Review regressions' {
+    Mock Write-Host { }
+    Mock Read-Host { if ($global:CrAnswers.Count -eq 0) { throw "unexpected question: $Prompt" }; $global:CrAnswers.Dequeue() }
+    function Set-Answers([string[]]$a) { $global:CrAnswers = New-Object System.Collections.Queue; foreach ($x in $a) { $global:CrAnswers.Enqueue($x) } }
+
+    It 'R1: audit survives an empty Claude-3p folder, no transcripts and no Desktop data' {
+        $m = New-FakeMachine; $sys = New-FakeSys -NoPackage
+        New-Item -ItemType Directory -Force -Path "$($m.Paths.LocalAppData)\Claude-3p" | Out-Null
+        $ctx = New-TestContext $m $sys
+        { Invoke-CrAudit $ctx -NoPause } | Should Not Throw
+        { Show-CrResults $ctx @([pscustomobject]@{ Path = 'x'; Status = 'refused'; Bytes = 0; Error = 'e' }) } | Should Not Throw
+        { Show-CrCodeDiagnostics $ctx } | Should Not Throw
+    }
+
+    It 'R2: paths longer than 260 characters are measured and deleted' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        $long = New-FakeLongFile "$r\local-agent-mode-sessions\acc"
+        $long.Length -gt 300 | Should Be $true
+        $ctx = New-TestContext $m $sys
+        (Get-CrSize "$r\local-agent-mode-sessions") | Should Be 1000
+        $res = @(Invoke-CrPlan $ctx (Get-CrDesktopPlan $ctx -Level 3))
+        @($res | Where-Object { $_.Status -eq 'failed' }).Count | Should Be 0
+        [System.IO.Directory]::Exists('\\?\' + $r) | Should Be $false
+        cmd /c rd /s /q "\\?\$($m.Root)"
+    }
+
+    It 'R2: backup manifest lists long-path files' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        $null = New-FakeLongFile "$r\local-agent-mode-sessions\acc"
+        $ctx = New-TestContext $m $sys
+        $b = New-CrBackup $ctx
+        $man = Get-Content -LiteralPath (Join-Path $b.Dir 'manifest.json') -Raw | ConvertFrom-Json
+        @($man.files | Where-Object { $_.backup -like '*long.txt' }).Count | Should Be 1
+        cmd /c rd /s /q "\\?\$($m.Root)"
+    }
+
+    It 'R3: a stale "not installed" never lets the tool delete the installed package folder' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        New-FakeFile "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc\Settings\settings.dat" 'win'
+        $ctx = New-TestContext $m $sys
+        $ctx.Package = $null                                   # stale cache: the app was reinstalled meanwhile
+        @(Get-CrDesktopPlan $ctx -Level 3 | Where-Object { $_.Path -like '*\Packages\Claude_pzs8sxrjxfjjc' }).Count | Should Be 0
+        (Test-CrDeletable $ctx "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc").Allowed | Should Be $false
+    }
+
+    It 'R3: when Windows cannot say whether the app is installed, the package folder is off limits' {
+        $m = New-FakeMachine; $sys = New-FakeSys -NoPackage
+        New-FakeFile "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc\Settings\settings.dat" 'win'
+        $sys.GetDesktopPackage = { throw 'AppX service unavailable' }
+        $ctx = New-TestContext $m $sys
+        @(Get-CrDesktopPlan $ctx -Level 3 | Where-Object { $_.Path -like '*\Packages\Claude_pzs8sxrjxfjjc' }).Count | Should Be 0
+        (Test-CrDeletable $ctx "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc").Allowed | Should Be $false
+    }
+
+    It 'R5: reinstall shows the plan, takes the word, and a wrong word changes nothing' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        $ctx = New-TestContext $m $sys
+        Set-Answers @('нет')
+        Invoke-CrReinstallFlow $ctx
+        $sys.State.Package | Should Not BeNullOrEmpty
+        Test-Path -LiteralPath "$r\config.json" | Should Be $true
+        $global:CrAnswers.Count | Should Be 0
+    }
+
+    It 'R5: reinstall with the word removes the app and its data, then checks Claude Code' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        New-FakeClaudeCode $m
+        $ctx = New-TestContext $m $sys
+        Set-Answers @('удалить', 'нет', '', '')
+        Invoke-CrReinstallFlow $ctx
+        ($sys.State.Log -join "`n") -match 'RemovePackage' | Should Be $true
+        Test-Path -LiteralPath $r | Should Be $false
+        @(Get-ChildItem -LiteralPath (Join-Path $ctx.DataDir 'backup') -Recurse -Filter 'claude_desktop_config.json').Count | Should Be 1
+        $global:CrAnswers.Count | Should Be 0
+    }
+
+    It 'R6: the CLI sign-out runs only after the confirmation word' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        New-FakeClaudeCode $m
+        $sys.FindClaudeCli = { @('C:\Users\u\.local\bin\claude.exe') }
+        $ctx = New-TestContext $m $sys
+        Set-Answers @('нет', 'нет', 'нет', 'нет')
+        Invoke-CrNoTracesWizard $ctx
+        ($sys.State.Log -join "`n") -match 'auth logout' | Should Be $false
+        Test-Path -LiteralPath "$($m.Paths.UserProfile)\.claude\.credentials.json" | Should Be $true
+    }
+
+    It 'R6: a browser that will not close can be skipped instead of aborting everything' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        $p = Join-Path $m.Paths.LocalAppData 'Microsoft\Edge\User Data\Default'
+        New-FakeFile "$p\Preferences" '{}'
+        $sys.State.Processes = @([pscustomobject]@{ Name = 'msedge'; Id = 5; Path = 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' })
+        $ctx = New-TestContext $m $sys
+        Set-Answers @('s')
+        $r = Wait-CrClosed $ctx -Desktop -Browsers
+        $r | Should Be 'skip-browsers'
+    }
+
+    It 'R7: residue after no-traces lists the tool''s own copies that hold account data' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        $ctx = New-TestContext $m $sys
+        $null = New-CrBackup $ctx
+        @(Get-CrResidue $ctx -NoTraces | Where-Object { $_.Area -eq 'tool-copies' }).Count | Should Be 1
+    }
+
+    It 'R8: a Desktop data folder that is a link is never walked through' {
+        $m = New-FakeMachine; $sys = New-FakeSys -NoPackage
+        $target = Join-Path $m.Root 'elsewhere\ClaudeData'
+        New-FakeFile "$target\config.json" '{"oauth:tokenCache":"T"}'
+        New-FakeFile "$target\Cache\d" 'c'
+        cmd /c mklink /J "$($m.Paths.AppData)\Claude" "$target" | Out-Null
+        $ctx = New-TestContext $m $sys
+        foreach ($lv in 1..3) { $null = Invoke-CrPlan $ctx (Get-CrDesktopPlan $ctx -Level $lv) }
+        Test-Path -LiteralPath "$target\Cache\d" | Should Be $true
+        Test-Path -LiteralPath "$target\config.json" | Should Be $true
+        (Test-CrDeletable $ctx "$($m.Paths.AppData)\Claude\Cache").Allowed | Should Be $false
+        @(Get-CrResidue $ctx | Where-Object { $_.Kind -eq 'manual' }).Count | Should Be 1
+    }
+
+    It 'R9: another site''s service-worker cache mentioning anthropic.com is not a Claude trace; Opera\Default is found' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $p = Join-Path $m.Paths.LocalAppData 'Google\Chrome\User Data\Default'
+        New-FakeFile "$p\Preferences" '{}'
+        New-FakeFile "$p\Service Worker\ScriptCache\abc_0" 'fetch("https://www.anthropic.com/news")'
+        $o = Join-Path $m.Paths.AppData 'Opera Software\Opera Stable\Default'
+        New-FakeFile "$o\Preferences" '{}'
+        New-FakeFile "$o\IndexedDB\https_claude.ai_0.indexeddb.leveldb\000003.log" 'idb'
+        $ctx = New-TestContext $m $sys
+        $plan = @(Get-CrBrowserPlan $ctx)
+        @($plan | Where-Object { $_.Kind -eq 'manual' }).Count | Should Be 0
+        @($plan | Where-Object { $_.Path -like '*Opera Stable\Default\IndexedDB\https_claude.ai*' }).Count | Should Be 1
+    }
+
+    It 'R10: level 2 keeps Desktop extensions together with the MCP config' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        New-FakeFile "$r\Claude Extensions\ext\manifest.json" '{}'
+        New-FakeFile "$r\Claude Extensions Settings\ext.json" '{}'
+        $ctx = New-TestContext $m $sys
+        $null = Invoke-CrPlan $ctx (Get-CrDesktopPlan $ctx -Level 2)
+        Test-Path -LiteralPath "$r\Claude Extensions\ext\manifest.json" | Should Be $true
+        Test-Path -LiteralPath "$r\Claude Extensions Settings\ext.json" | Should Be $true
+    }
+
+    It 'R11: foreign folders inside the package are shown, and uninstall is part of the shown plan' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $null = New-FakeMsixDesktop $m
+        New-FakeFile "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\create-next-app-nodejs\Config\config.json" '{}'
+        $ctx = New-TestContext $m $sys
+        @(Get-CrDesktopInventory $ctx | Where-Object { $_.Group -eq 'foreign' }).Count | Should Be 1
+        $plan = @(Get-CrDesktopPlan $ctx -Level 3 -Uninstall)
+        @($plan | Where-Object { $_.Kind -eq 'uninstall' }).Count | Should Be 1
+        @($plan | Where-Object { $_.Path -like '*\Packages\Claude_pzs8sxrjxfjjc' }).Count | Should Be 1
+        $null = Invoke-CrPlan $ctx $plan
+        ($sys.State.Log -join "`n") -match 'RemovePackage' | Should Be $true
+        Test-Path -LiteralPath "$($m.Paths.LocalAppData)\Packages\Claude_pzs8sxrjxfjjc" | Should Be $false
+    }
+
+    It 'R12: a token in settings.json env and a Claude Code running under node are noticed' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        New-FakeClaudeCode $m
+        New-FakeFile "$($m.Paths.UserProfile)\.claude\settings.json" '{"env":{"ANTHROPIC_API_KEY":"sk"},"apiKeyHelper":"x.cmd"}'
+        $sys.State.Processes = @([pscustomobject]@{ Name = 'node'; Id = 9; Path = 'C:\nodejs\node.exe'; CommandLine = 'node C:\Users\u\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js' })
+        $ctx = New-TestContext $m $sys
+        @(Get-CrCodeAuthPlan $ctx | Where-Object { $_.Kind -eq 'manual' -and $_.Purpose -match 'settings.json' }).Count | Should Be 1
+        (Get-CrClaudeProcesses $ctx).Code.Count | Should Be 1
+    }
+
+    It 'R13: a repository or CLAUDE.md deep inside Desktop data survives level 3' {
+        $m = New-FakeMachine; $sys = New-FakeSys
+        $r = New-FakeMsixDesktop $m
+        New-FakeFile "$r\local-agent-mode-sessions\a\b\work\.git\HEAD" 'ref'
+        New-FakeFile "$r\local-agent-mode-sessions\a\c\notes\CLAUDE.md" 'rules'
+        $ctx = New-TestContext $m $sys
+        $res = @(Invoke-CrPlan $ctx (Get-CrDesktopPlan $ctx -Level 3))
+        Test-Path -LiteralPath "$r\local-agent-mode-sessions\a\b\work\.git\HEAD" | Should Be $true
+        Test-Path -LiteralPath "$r\local-agent-mode-sessions\a\c\notes\CLAUDE.md" | Should Be $true
+        Test-Path -LiteralPath "$r\Cache" | Should Be $false
+        @($res | Where-Object { $_.Status -eq 'partial' }).Count | Should Be 1
     }
 }
