@@ -503,6 +503,17 @@ class TestSecondPass(Box):
         for gone in ("plugin-mcp-auth", "logs", "window-state.json", "Local State"):
             self.assertFalse((r / gone).exists(), gone)
 
+    def test_level2_in_a_custom_place_does_not_lose_its_root_midway(self):
+        alt = self.root / "cfg" / "Claude"
+        write(alt / "Local State", "{}")
+        write(alt / "logs" / "main.log", "log")
+        write(alt / "window-state.json", "{}")
+        write(alt / "plugin-mcp-auth" / "x" / ".credentials.json", "{}")
+        self.ctx.env = {"XDG_CONFIG_HOME": str(self.root / "cfg")}
+        res = cr.run_plan(self.ctx, cr.desktop_plan(self.ctx, 2))
+        self.assertEqual([x.path for x in res if x.status == "refused"], [])
+        self.assertFalse((alt / "plugin-mcp-auth").exists())
+
     def test_a_partial_level3_stays_visible_in_residue(self):
         r = self.desktop()
         write(r / "local-agent-mode-sessions" / "a" / "work" / ".git" / "HEAD", "ref")
